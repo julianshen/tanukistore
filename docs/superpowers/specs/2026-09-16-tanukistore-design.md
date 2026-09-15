@@ -121,6 +121,29 @@ non-conforming names. Nothing parses filenames on the read path.
 **Decision:** the app controls `setFeedURL` entirely, so the full coordinate is encoded in
 the URL it sets. See §6.
 
+### 4.7 Manifests embed server URLs, not presigned URLs
+
+**Conflict:** source §9 requires cached manifest bytes to go into the response with no
+re-serialization, but source §6 requires `latest.json` to carry a presigned `url`. Presigned
+URLs are time-limited and differ per request, so stored bytes cannot contain one — honouring
+§6 literally would force a re-serialization per request, which is exactly what §9 forbids.
+
+**Decision:** manifests embed URLs pointing at tanukistore's **own** download routes, which
+respond `302` with a freshly minted presigned URL. Consequences, all of them simplifying:
+
+- Manifests are genuinely static, so the zero-copy claim holds and `derive()` stays a pure
+  function needing no signing credentials.
+- Presigning moves to the moment a download actually starts, with a short TTL (15 min), and
+  source §6's "presign TTL must exceed worst-case download start delay" constraint disappears
+  — the embedded URL never expires.
+- `RELEASES` emits **relative** filenames (`{sha1} {filename} {size}`), the classic Squirrel
+  format resolved against the feed base URL. This is the most widely compatible form and is
+  why Squirrel.Windows works against plain static hosting. It requires one extra route serving
+  nupkgs beneath the feed path (§6).
+- `latest.json` needs an **absolute** `url`, because Squirrel.Mac hands it to `NSURLSession`.
+  So `derive()` takes the public base URL as a parameter, and changing the public hostname
+  requires re-deriving manifests. Documented and accepted.
+
 ## 5. Data model
 
 Unchanged from source §3, restated for precision. All objects live in one MinIO bucket.
@@ -152,8 +175,9 @@ appended entry.
 
 | Route | Client | Behavior |
 |---|---|---|
-| `GET /update/:app/darwin/:arch/:version[/:channel]` | Squirrel.Mac | Resolve highest eligible release; `204` if the client is current, else the cached `latest.json` body with a presigned `url` |
-| `GET /update/:app/win32/:arch[/:channel]/RELEASES` | Squirrel.Windows | Cached `RELEASES` manifest, one `{sha1} {presigned-url} {size}` line per asset |
+| `GET /update/:app/darwin/:arch/:version[/:channel]` | Squirrel.Mac | Resolve highest eligible release; `204` if the client is current, else the cached `latest.json` body verbatim (its `url` points at `/download/...`, §4.7) |
+| `GET /update/:app/win32/:arch[/:channel]/RELEASES` | Squirrel.Windows | Cached `RELEASES` manifest, one `{sha1} {filename} {size}` line per full nupkg, ascending by version |
+| `GET /update/:app/win32/:arch[/:channel]/:filename` | Squirrel.Windows | `302` to a presigned nupkg URL — resolves the relative filenames in `RELEASES` (§4.7) |
 | `GET /download/:app/latest?platform=&arch=&channel=` | Humans / CI | `302` to a fresh presigned URL |
 | `GET /download/:app/:version?platform=&arch=&filename=` | Humans / CI | `302` to a presigned URL for a pinned version |
 | `GET /notes/:app/:version?channel=` | Any | Release notes from the matching `index.json` entry |
@@ -182,10 +206,10 @@ by network policy and by omission from ingress, not by binding. `/metrics` on th
 listener would publish app names, channel names, release versions and traffic volumes to
 anyone who can reach the update feed.
 
-**Presign TTL constraint.** Presigned URLs embedded in `RELEASES` must outlive the delay
-between a client fetching the manifest and actually starting a multi-hundred-megabyte
-download. Presign TTL is therefore **1 hour**, well above the manifest freshness window.
-The invariant to preserve: *presign TTL must exceed worst-case download start delay.*
+**Presign TTL.** Because manifests embed tanukistore's own download routes rather than
+presigned URLs (§4.7), presigning happens only when a download actually begins. TTL is
+therefore **15 minutes** — it must merely outlive connection setup and any client retry of a
+single request, not the arbitrary delay between a manifest fetch and a download.
 
 ## 7. Crate topology
 
@@ -201,7 +225,7 @@ crates/core/          no I/O beyond the ObjectStore trait
   store.rs            ObjectStore trait, S3CompatibleStore, InMemoryStore (test fake),
                       CircuitBreakerStore<S> decorator
   cache.rs            ManifestCache (moka + try_get_with single-flight, freshness, stale-on-error)
-  derive.rs           pure: &Index -> (latest.json bytes, RELEASES bytes)
+  derive.rs           pure: (&Index, &Coordinate, base_url) -> (latest.json, RELEASES)
   rollout.rs          fixed-seed bucketing (§4.2)
   events.rs           VersionCheckEvent, VersionCheckSink, NoopSink, JetStreamSink
 
