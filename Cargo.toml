@@ -1,0 +1,8 @@
+[package]
+name = "tanukistore"
+version = "0.1.0"
+edition = "2024"
+description = "Self-hosted Electron autoUpdater server backed by S3-compatible object storage"
+publish = false
+
+[dependencies]
