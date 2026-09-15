@@ -2,3 +2,4 @@
 //! version resolution, and Squirrel manifest derivation. No I/O lives here.
 
 pub mod model;
+pub mod keys;
