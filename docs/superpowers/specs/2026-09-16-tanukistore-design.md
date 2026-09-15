@@ -137,6 +137,13 @@ sha1, sha512, size_bytes }] }`. `sha1` is not redundant with `sha512` — it exi
 satisfy the `RELEASES` format and the publisher must compute both. `latest.json` and
 `RELEASES` are pure derivations, recomputed whenever `index.json` changes.
 
+The two derivations are **asymmetric**, which shapes `derive()`. `latest.json` describes
+exactly one release — the newest eligible entry. `RELEASES` must list **every full nupkg in
+the channel's history**, because Squirrel.Windows performs its own comparison and needs a
+line for whatever version the client happens to be running. So `derive()` reads the newest
+entry for macOS and walks the whole index for Windows. Getting this wrong yields a Windows
+feed that works for recent clients and silently fails for older ones.
+
 Versions are `semver::Version`. Resolution picks the highest eligible version, not the last
 appended entry.
 
@@ -208,8 +215,57 @@ the new entry → conditional `PutObject` with `If-Match` → on `412`, re-read 
 exponential backoff and jitter, bounded at **5 attempts**, then fail loudly → derive and
 upload `latest.json` and `RELEASES`.
 
+Asset-upload-before-manifest-write is the ordering's whole point, not incidental: reversed,
+there is a window in which `latest.json` advertises a version whose bytes do not exist yet,
+and every client polling in that window receives a presigned URL to a missing object. Because
+manifests are written last, the manifest write is the commit point — a release is invisible
+until the manifest naming it lands. Non-atomicity across the two derived manifests is
+harmless, since macOS only ever reads `latest.json` and Windows only ever reads `RELEASES`,
+so each platform's visibility flips independently and no client observes a mix.
+
 **Invalidation.** MinIO bucket notification → NATS subject → every replica's subscriber
 evicts the matching L1 key.
+
+### 8.1 Publisher interface
+
+Three subcommands. One invocation may carry several `platform/arch` targets, since an Electron
+build normally emits darwin-arm64, darwin-x64 and win32-x64 together.
+
+```sh
+tanukistore-publish release \
+  --app myapp --channel stable --version 1.5.0 \
+  --rollout-pct 10 --notes-file RELEASE_NOTES.md \
+  --target darwin/arm64=dist/app-arm64.zip \
+  --target darwin/x64=dist/app-x64.zip \
+  --target win32/x64=dist/App-1.5.0-full.nupkg
+
+tanukistore-publish advance-rollout \
+  --app myapp --channel stable --version 1.5.0 --to 50
+
+tanukistore-publish verify --app myapp --channel stable
+```
+
+- **`release`** runs steps 1–8 for every target. Each target owns a distinct `index.json`
+  key, so targets never contend with one another. All assets across all targets upload before
+  any manifest is committed, so a failure during upload publishes nothing. The operation is
+  **not transactional across targets**: if a later target's manifest commit fails, earlier
+  targets remain published, and the command exits non-zero naming exactly which targets
+  committed. Re-running is the recovery path.
+- **`advance-rollout`** mutates the `rollout_pct` of an existing entry and uploads no assets.
+  It reuses steps 4–8 — read with ETag, modify, conditional write, re-derive, upload.
+- **`verify`** is read-only: it confirms every asset referenced by `index.json` exists, that
+  recorded hashes match the stored objects, that the derived manifests agree with the index,
+  and that Windows filenames satisfy the Squirrel convention. Intended for CI and for
+  post-incident checks.
+
+**Versions are immutable by default.** Publishing a version that already exists is refused
+unless `--force` is given, because replacing the bytes of a published version changes the
+SHA-1 in `RELEASES` underneath clients that are mid-download or have already fetched the
+manifest, and clients that downloaded earlier end up running different bytes than clients
+downloading now. `--force` is for correcting a broken publish, not for re-cutting a release.
+
+A `--dry-run` flag on `release` and `advance-rollout` performs validation, hashing and
+derivation, printing what would be written without touching the bucket.
 
 ## 9. Resilience
 
@@ -345,8 +401,8 @@ Written in this order, because the first item is what decides whether the fleet 
 
 ## 14. Open questions
 
-- Rollout advancement is manual (edit `rollout_pct`, republish). Automated time-based ramping
-  is out of scope for v1.
+- Rollout advancement is operator-driven via `advance-rollout` (§8.1). Automated time-based
+  ramping is out of scope for v1.
 - JetStream retention (age versus byte limits) and `uid`-scoped deletion for erasure requests
   are unresolved compliance decisions, carried over from source §13.
 - Publish-time code-signing verification remains open (source §13).
