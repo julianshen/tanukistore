@@ -25,6 +25,7 @@ a plausible-but-wrong manifest means clients never update and nobody finds out f
 - Publisher CLI: upload assets, conditional `index.json` write, derive manifests.
 - Staged rollouts (`rollout_pct`) with deterministic, fixed-seed bucketing.
 - OpenTelemetry tracing, metrics, and structured logs (source §8).
+- Separate admin listener exposing Prometheus `/metrics`, `/healthz`, `/readyz`.
 - `VersionCheckSink` with both `NoopSink` and a real `JetStreamSink`, config-selected.
 - Cache invalidation driven by MinIO bucket notifications over NATS.
 - Bulkhead + circuit breaker protecting MinIO.
@@ -156,7 +157,6 @@ appended entry.
 | `GET /download/:app/latest?platform=&arch=&channel=` | Humans / CI | `302` to a fresh presigned URL |
 | `GET /download/:app/:version?platform=&arch=&filename=` | Humans / CI | `302` to a presigned URL for a pinned version |
 | `GET /notes/:app/:version?channel=` | Any | Release notes from the matching `index.json` entry |
-| `GET /healthz`, `GET /readyz` | Orchestrator | Liveness / readiness |
 
 Channel defaults to the app's `defaultChannel`. There is deliberately **no write route**;
 the bucket's own access policy is the only write-side security boundary (source §11).
@@ -165,6 +165,22 @@ the bucket's own access policy is the only write-side security boundary (source 
 the two update routes is registered as two explicit patterns. The download and notes filters
 are query parameters rather than optional path segments, which avoids a combinatorial
 explosion of route registrations.
+
+### 6.1 Listeners
+
+The server binds **two** listeners, so operational endpoints are never reachable from the
+public feed:
+
+| Listener | Default | Routes |
+|---|---|---|
+| public | `0.0.0.0:8080` | `/update/*`, `/download/*`, `/notes/*` |
+| admin | `0.0.0.0:9090` | `/metrics`, `/healthz`, `/readyz` |
+
+Only the public port belongs in ingress or a public Service. The admin port binds `0.0.0.0`
+rather than loopback because Prometheus scrapes across the pod network, so it is kept private
+by network policy and by omission from ingress, not by binding. `/metrics` on the public
+listener would publish app names, channel names, release versions and traffic volumes to
+anyone who can reach the update feed.
 
 **Presign TTL constraint.** Presigned URLs embedded in `RELEASES` must outlive the delay
 between a client fetching the manifest and actually starting a multi-hundred-megabyte
@@ -332,9 +348,57 @@ Every `/update/...` request opens one `update.check` span with attributes `app`,
   invents an identity for an anonymous client.
 - Tail-based sampling always keeps spans carrying `user.id`, up to a volume cap.
 
-Metrics beyond the source design: `manifest_stale_served_total`,
-`version_check_events_dropped_total`, `circuit_breaker_state{target="minio"}`,
-`circuit_breaker_rejected_total`, `origin_fetch_duration_seconds`.
+### 10.1 Metrics facade
+
+The source design mixes two incompatible facades — `metrics::counter!` from the `metrics`
+crate in its `VersionCheckEventChannel`, and the OTel API with `KeyValue` in its
+`handle_update_check`. Two facades mean two registries, and an exporter wired to one would
+silently omit the other's counters.
+
+**Decision:** the **OTel metrics API** is the single facade, since the OTel SDK is already
+required for traces. The `metrics` crate is not a dependency.
+
+### 10.2 Exposition
+
+Metrics are exposed for **Prometheus scrape** at `GET /metrics` on the admin listener (§6.1)
+via a Prometheus exporter registered on the OTel meter provider. Traces continue to
+**push OTLP** to the Collector, which Prometheus cannot carry. Metrics are not also pushed;
+one reporting path avoids two sources of truth that can disagree.
+
+The publisher CLI is a short-lived process with no scrape endpoint. It emits structured logs
+and, when configured, OTLP traces — it reports no scraped metrics.
+
+### 10.3 Metric inventory
+
+| Metric | Type | Labels |
+|---|---|---|
+| `update_checks_total` | counter | `app`, `channel`, `platform`, `arch`, `update_available` |
+| `cache_lookups_total` | counter | `key_kind`, `tier` (`l1`/`origin`/`stale`) |
+| `manifest_stale_served_total` | counter | `app`, `key_kind` |
+| `origin_fetch_duration_seconds` | histogram | `key_kind`, `outcome` |
+| `origin_fetch_inflight` | gauge | — (bulkhead saturation against the 32 cap) |
+| `circuit_breaker_state` | gauge | `target` — `0` closed, `1` half-open, `2` open |
+| `circuit_breaker_rejected_total` | counter | `target` |
+| `version_check_events_dropped_total` | counter | `app` |
+| `release_current_version_info` | gauge (always `1`) | `app`, `channel`, `platform`, `arch`, `version` |
+
+### 10.4 Cardinality budget
+
+Direct scrape makes the process the only place cardinality can be enforced — with OTLP push a
+bad label can be dropped at the Collector, but a scraped series ships immediately and persists
+for Prometheus' full retention. The allowed label sets above are therefore exhaustive.
+
+**Forbidden as metric labels, permitted as span attributes:**
+
+- `uid` and `cid` — unbounded, and §10's privacy boundary forbids user-attributable aggregates.
+- `requested_version` — genuinely long-tailed. A real fleet has every version anyone ever
+  installed still checking in, so this is a high-cardinality dimension, not a small enum.
+- `resolved_version` — grows a permanent new series on every release.
+
+`release_current_version_info` is the one deliberate exception: it carries `version` as a
+label in the Prometheus `*_info` idiom, so "what does this coordinate currently serve?" is
+queryable. It churns one series per release per coordinate, which is bounded by release
+frequency (a few per day at most) and ages out of retention normally.
 
 ## 11. Error handling and failure modes
 
@@ -394,7 +458,8 @@ Written in this order, because the first item is what decides whether the fleet 
 5. `server`: both feeds + download/notes routes, against `InMemoryStore`.
 6. `publish`: upload, validation, conditional write with retry, derivation upload.
 7. MinIO integration tests via testcontainers; end-to-end against a real MinIO.
-8. Telemetry: tracing, metrics, structured logs, `NoopSink`.
+8. Telemetry: tracing, structured logs, OTel metrics, admin listener with `/metrics`,
+   `NoopSink`.
 9. `JetStreamSink` + bounded MPSC + background publisher task.
 10. NATS-driven invalidation; multi-replica fan-out test.
 11. Baseline load measurement; revisit the source §9 deferral.
