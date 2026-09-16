@@ -1,0 +1,25 @@
+# Build artifacts. At ~378M this is by far the largest thing in the context,
+# and it is useless to the image: the builder stage compiles from scratch
+# against the container's own toolchain, not the host's.
+target/
+**/target/
+
+# VCS and agent/tooling state.
+.git/
+.github/
+.claude/
+.superpowers/
+
+# Design notes and specs: not needed to compile.
+docs/
+*.md
+!crates/core/tests/fixtures/README.md
+
+# Container definitions themselves.
+Dockerfile
+.dockerignore
+
+# Local environment.
+.env
+.env.*
+.DS_Store
