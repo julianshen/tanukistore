@@ -14,8 +14,15 @@ pub enum DeriveError {
     FilenameHasWhitespace { filename: String },
     #[error("sha1 {sha1:?} for {filename:?} is not 40 hex characters")]
     MalformedSha1 { filename: String, sha1: String },
-    #[error("base_url {base_url:?} must be absolute and start with http:// or https://")]
-    RelativeBaseUrl { base_url: String },
+    #[error("base_url {base_url:?} is unusable: {reason}")]
+    UnusableBaseUrl {
+        base_url: String,
+        reason: &'static str,
+    },
+    #[error(
+        "release {version} has rollout_pct {rollout_pct}, but Squirrel.Windows compares versions          itself, so a partial rollout cannot be staged on win32 - publish it at 100 or hold it back"
+    )]
+    StagedRolloutUnsupportedOnWindows { version: String, rollout_pct: u8 },
 }
 
 /// The Squirrel.Mac manifest. Field declaration order IS the serialized
@@ -40,26 +47,62 @@ struct LatestManifest {
 ///
 /// `rollout_pct` is deliberately not honoured per-client here: `latest.json`
 /// is one stored object shared by the whole fleet, so it can only describe a
-/// release at 100%. Per-client rollout filtering happens in the server
-/// handler against `index.json`.
+/// release at 100%. That is the safe direction - a staged release can never
+/// leak to every client through this file.
+///
+/// UNRESOLVED, and deliberately not papered over: how a staged macOS release
+/// reaches the clients that ARE eligible. Spec 6 has the darwin route serve
+/// this file "verbatim", while spec 8's read path says the handler evaluates
+/// rollout against `cid`/`uid` - but `LatestManifest` carries no
+/// `rollout_pct`, so there is nothing in these bytes to evaluate, and a
+/// release below 100% is therefore delivered to nobody. Closing that needs a
+/// storage/serving decision (serve a manifest derived per request from
+/// `index.json`, or precompute one manifest per release and select among
+/// them), which is a spec change rather than something this function can fix.
 ///
 /// `url` points at tanukistore's own download route rather than a presigned
 /// MinIO URL (spec 4.7), which is what keeps these bytes static and lets the
 /// server return them without re-serializing.
+/// Check that `base_url` can actually be joined into an absolute download URL.
+///
+/// Spec 4.7 requires `latest.json`'s `url` to be ABSOLUTE, because Squirrel.Mac
+/// hands it to `NSURLSession`. A scheme prefix alone does not guarantee that:
+/// `"https://"` starts with `https://` yet has no authority, and
+/// [`crate::keys::Coordinate::download_url`] would trim its trailing slashes
+/// and emit `https:/download/...`, which no client can fetch. A query or
+/// fragment on the base is likewise unjoinable - it would land before the path.
+///
+/// Exposed so the publisher can reject a bad configuration at startup rather
+/// than at the first derive.
+pub fn validate_base_url(base_url: &str) -> Result<(), DeriveError> {
+    let unusable = |reason: &'static str| DeriveError::UnusableBaseUrl {
+        base_url: base_url.to_owned(),
+        reason,
+    };
+    let authority_and_path = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .ok_or_else(|| unusable("must start with http:// or https://"))?;
+    if authority_and_path
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return Err(unusable("has a scheme but no host"));
+    }
+    if base_url.contains('?') || base_url.contains('#') {
+        return Err(unusable("must not carry a query string or fragment"));
+    }
+    Ok(())
+}
+
 pub fn derive_latest(
     index: &Index,
     coord: &Coordinate,
     base_url: &str,
 ) -> Result<Option<Vec<u8>>, DeriveError> {
-    // Spec 4.7 requires latest.json's `url` to be ABSOLUTE, because
-    // Squirrel.Mac hands it to NSURLSession. An empty or scheme-less base
-    // would yield a relative URL the client cannot use, and nothing
-    // downstream would notice.
-    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
-        return Err(DeriveError::RelativeBaseUrl {
-            base_url: base_url.to_owned(),
-        });
-    }
+    validate_base_url(base_url)?;
     let Some(release) = resolve::resolve_eligible(index, &coord.app, &coord.channel, None) else {
         return Ok(None);
     };
@@ -132,6 +175,22 @@ pub fn derive_releases(index: &Index) -> Result<Vec<u8>, DeriveError> {
             });
         }
         previous = Some(release);
+
+        // Squirrel.Windows compares versions against RELEASES itself and never
+        // consults a server-side eligibility check, so a line in this file is
+        // offered to EVERY Windows client. Withholding the line cannot stage a
+        // rollout either - it only breaks clients already on that version. So a
+        // rollout_pct below 100 here has exactly one honest outcome: refuse it,
+        // rather than silently serving a 10% canary to the whole fleet. Spec 5
+        // puts Windows staging out of scope for v1; this is what enforcing that
+        // looks like instead of documenting it and hoping. index.json is
+        // per-platform (spec 5), so darwin can still stage independently.
+        if release.rollout_pct.get() < 100 {
+            return Err(DeriveError::StagedRolloutUnsupportedOnWindows {
+                version: release.version.to_string(),
+                rollout_pct: release.rollout_pct.get(),
+            });
+        }
 
         let asset = pick(release, AssetKind::Nupkg)?;
         // Squirrel.Windows' entry parser matches the filename field as (\S+)
@@ -297,7 +356,35 @@ mod tests {
         for base in ["", "updates.example.com", "/download", "ftp://x.example"] {
             assert_eq!(
                 derive_latest(&index, &coord(), base),
-                Err(DeriveError::RelativeBaseUrl { base_url: base.to_owned() }),
+                Err(DeriveError::UnusableBaseUrl {
+                    base_url: base.to_owned(),
+                    reason: "must start with http:// or https://",
+                }),
+                "base_url {base:?}"
+            );
+        }
+        // A scheme prefix alone is not enough: these pass a `starts_with`
+        // check and still cannot be joined into a fetchable URL.
+        for base in ["https://", "http://", "https:///download"] {
+            assert_eq!(
+                derive_latest(&index, &coord(), base),
+                Err(DeriveError::UnusableBaseUrl {
+                    base_url: base.to_owned(),
+                    reason: "has a scheme but no host",
+                }),
+                "base_url {base:?}"
+            );
+        }
+        for base in [
+            "https://updates.example.com/?x=1",
+            "https://updates.example.com#frag",
+        ] {
+            assert_eq!(
+                derive_latest(&index, &coord(), base),
+                Err(DeriveError::UnusableBaseUrl {
+                    base_url: base.to_owned(),
+                    reason: "must not carry a query string or fragment",
+                }),
                 "base_url {base:?}"
             );
         }
@@ -351,12 +438,28 @@ mod tests {
     }
 
     #[test]
-    fn releases_includes_partial_rollout_entries() {
-        // Squirrel.Windows does its own comparison, so withholding a line
-        // cannot implement a rollout. The line must be present.
+    fn releases_rejects_a_partial_rollout_because_windows_cannot_stage() {
+        // A line in RELEASES reaches every Windows client, and withholding it
+        // would break clients already on that version - so neither emitting
+        // nor omitting implements a rollout. Refusing is the only honest
+        // option; the alternative ships a 10% canary to 100% of the fleet.
         let mut staged = nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 3);
         staged.rollout_pct = RolloutPct::new(10).unwrap();
         let index = Index { releases: vec![staged] };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::StagedRolloutUnsupportedOnWindows {
+                version: "1.5.0".to_owned(),
+                rollout_pct: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn releases_accepts_a_full_rollout() {
+        let index = Index {
+            releases: vec![nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 3)],
+        };
         let text = String::from_utf8(derive_releases(&index).unwrap()).unwrap();
         assert!(text.contains("1.5.0"), "{text}");
     }
