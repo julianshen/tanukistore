@@ -5,8 +5,10 @@ use crate::rollout;
 ///
 /// Highest-version rather than last-appended: `index.json` is append-only,
 /// so publishing a 1.4.1 hotfix after 1.5.0 must not downgrade the fleet.
-/// semver ordering also puts `1.5.0-beta.1` below `1.5.0`, which is what a
-/// channel serving both should do.
+/// Uses semver ordering via `max_by`, which correctly puts `1.5.0-beta.1`
+/// below `1.5.0`. Note: the semver crate includes build metadata in its Ord
+/// implementation (differing from the semver specification), so versions
+/// differing only in build metadata will order deterministically.
 pub fn resolve_eligible<'a>(
     index: &'a Index,
     app: &str,
@@ -70,16 +72,22 @@ mod tests {
     }
 
     #[test]
-    fn build_metadata_does_not_affect_ordering() {
-        // Per semver, build metadata is ignored in comparison, so two
-        // releases differing only by +build are ordered arbitrarily. The
-        // publisher must never rely on it to distinguish releases.
+    fn build_metadata_does_affect_ordering_in_this_crate() {
+        // The semver SPECIFICATION says build metadata is not relevant to precedence
+        // (https://semver.org/#spec-item-10: "Build metadata SHOULD be ignored when
+        // determining version precedence"). However, the semver CRATE's derived Ord
+        // includes the build field, so 1.5.0+build.1 < 1.5.0+build.2 lexicographically
+        // on the build identifier. This characterises semver 1.0.28 behaviour.
+        //
+        // Consequence: republishing a version with different build metadata silently
+        // changes which release resolves as the newest, potentially downgrading clients.
         let a = release("1.5.0+build.1", 100);
         let b = release("1.5.0+build.2", 100);
+        assert_eq!(a.version.cmp(&b.version), std::cmp::Ordering::Less);
         let index = Index { releases: vec![a, b] };
         let got = resolve_eligible(&index, "myapp", "stable", None).unwrap();
-        assert_eq!(got.version.major, 1);
-        assert_eq!(got.version.minor, 5);
+        // Since b > a due to build metadata ordering, b (1.5.0+build.2) is the max.
+        assert_eq!(got.version, Version::parse("1.5.0+build.2").unwrap());
     }
 
     #[test]
