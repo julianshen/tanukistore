@@ -80,7 +80,8 @@ impl Coordinate {
         let base = base_url.trim_end_matches('/');
         let app = &self.app;
         // Pair order is the emitted query order and the golden fixture asserts
-        // on it, so do not reorder.
+        // on it, so do not reorder. Frozen, not verified — see
+        // tests/fixtures/README.md.
         let query = form_urlencoded::Serializer::new(String::new())
             .append_pair("platform", &self.platform.to_string())
             .append_pair("arch", &self.arch.to_string())

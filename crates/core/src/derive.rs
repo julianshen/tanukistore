@@ -19,7 +19,10 @@ pub enum DeriveError {
 }
 
 /// The Squirrel.Mac manifest. Field declaration order IS the serialized
-/// order, and the golden fixture asserts on it, so do not reorder.
+/// order, and the golden fixture asserts on it, so do not reorder. Note that
+/// this makes the order *frozen*, not *verified*: the fixture encodes our
+/// belief about the wire format and no real Squirrel client has accepted it
+/// yet. See `tests/fixtures/README.md` and spec 12 item 1.
 ///
 /// Private: `derive_latest` returns serialized bytes, so no public function
 /// hands one of these out, and it carries neither `Deserialize` nor
