@@ -1,0 +1,117 @@
+# Self-hosted MinIO for tanukistore: the S3-compatible object storage that
+# spec 4.1 makes the system of record.
+#
+# STANDALONE, single replica, single drive. This is deliberately NOT the
+# distributed/erasure-coded topology a real deployment wants: the cluster is one
+# node, so replicas would all land on the same disk and buy availability theatre
+# rather than availability. Sized for correctness work and capacity baselining.
+#
+# Credentials are NOT in this file. Create the Secret out of band so it never
+# reaches git:
+#   kubectl -n tanukistore create secret generic minio-credentials \
+#     --from-literal=root-user=tanukistore \
+#     --from-literal=root-password="$(openssl rand -base64 24)"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tanukistore
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: tanukistore
+spec:
+  accessModes: [ReadWriteOnce]
+  # local-path, not directpv: local-path is the cluster default and is backed by
+  # the node's NVMe root filesystem. directpv exists here but wants drives
+  # explicitly formatted and claimed, which is a bigger commitment than a
+  # capacity baseline needs.
+  storageClassName: local-path
+  resources:
+    requests:
+      # The node root filesystem has ~21G free, so this stays modest on purpose.
+      # A 200MB asset plus multipart staging fits many times over.
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: tanukistore
+  labels: { app: minio }
+spec:
+  replicas: 1
+  # A single RWO volume on one node cannot be attached to an old and a new pod
+  # at once, so the default RollingUpdate would deadlock: the new pod waits for
+  # a volume the terminating pod still holds.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: minio-credentials, key: root-user }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: minio-credentials, key: root-password }
+          ports:
+            - { name: api, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          resources:
+            requests: { cpu: "500m", memory: 1Gi }
+            # Limits are generous by design. This workload exists to find the
+            # node's throughput ceiling, and a tight CPU limit would measure the
+            # limit instead of the hardware.
+            limits: { cpu: "8", memory: 8Gi }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: api }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /minio/health/live, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: minio-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: tanukistore
+spec:
+  type: ClusterIP
+  selector: { app: minio }
+  ports:
+    - { name: api, port: 9000, targetPort: api }
+    - { name: console, port: 9001, targetPort: console }
+
+# Deliberately ClusterIP only, with no NodePort and nothing published off the
+# node. The load generator runs INSIDE the cluster as a Job, so it dials this
+# Service directly and the object bytes never leave the cluster network.
+#
+# That is both safer and more accurate. A NodePort would put the host network
+# in the measurement path, and a `kubectl port-forward` would be worse still -
+# it is a single userspace proxy process that saturates long before MinIO does,
+# so every throughput number would really be a measurement of port-forward.
+# In-cluster traffic is also the path tanukistore-server itself will take.
+#
+# For ad-hoc console access, forward it for the duration only:
+#   kubectl -n tanukistore port-forward svc/minio 9001:9001

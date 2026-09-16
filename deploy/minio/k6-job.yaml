@@ -1,0 +1,49 @@
+# Runs the 200MB capacity baseline as an in-cluster Job.
+#
+# The script is NOT baked into an image - it is mounted from a ConfigMap built
+# straight from loadtest/, so iterating on the test is a re-apply rather than a
+# rebuild-and-push cycle:
+#   kubectl -n tanukistore create configmap k6-scripts \
+#     --from-file=loadtest/minio-200mb.js --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n tanukistore delete job k6-minio-200mb --ignore-not-found
+#   kubectl -n tanukistore apply -f deploy/minio/k6-job.yaml
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-minio-200mb
+  namespace: tanukistore
+spec:
+  backoffLimit: 0 # a failed load test should be read, not silently retried
+  template:
+    metadata:
+      labels: { app: k6, test: minio-200mb }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.58.0
+          args: ["run", "/scripts/minio-200mb.js"]
+          env:
+            # Explicit rather than relying on the script default, so the same
+            # image can be pointed at tanukistore's own /download route later
+            # without touching the script.
+            - name: OBJECT_URL
+              value: http://minio.tanukistore.svc.cluster.local:9000/tanukistore-assets/asset-200mb.bin
+            - name: OBJECT_BYTES
+              value: "209715200"
+          resources:
+            # The load generator must not be the bottleneck. k6 is cheap per VU
+            # once bodies are discarded, but TLS-free 200MB reads still burn CPU
+            # in the syscall path, so give it real headroom - if k6 throttles,
+            # the run measures k6.
+            requests: { cpu: "1", memory: 512Mi }
+            limits: { cpu: "4", memory: 2Gi }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+            - { name: results, mountPath: /results }
+      volumes:
+        - name: scripts
+          configMap: { name: k6-scripts }
+        - name: results
+          emptyDir: {}

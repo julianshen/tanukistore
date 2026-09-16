@@ -1,0 +1,60 @@
+# Seeds the load-test fixture: a bucket holding one 200MB object standing in for
+# an Electron app bundle, which is the payload spec 4.7's /download route exists
+# to serve.
+#
+# Re-runnable: delete the Job first, since a completed Job is immutable.
+#   kubectl -n tanukistore delete job minio-seed --ignore-not-found
+#   kubectl -n tanukistore apply -f deploy/minio/seed-job.yaml
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-seed
+  namespace: tanukistore
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+          env:
+            - name: ROOT_USER
+              valueFrom:
+                secretKeyRef: { name: minio-credentials, key: root-user }
+            - name: ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: minio-credentials, key: root-password }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mc alias set local http://minio:9000 "$ROOT_USER" "$ROOT_PASSWORD"
+              mc mb --ignore-existing local/tanukistore-assets
+
+              # Anonymous read on this bucket only. It lets k6 issue a plain GET
+              # instead of implementing AWS SigV4, so the test measures object
+              # delivery rather than a hand-rolled signer. Acceptable ONLY
+              # because the bucket holds synthetic random bytes on a private
+              # cluster - a real asset bucket must stay private and be reached
+              # through presigned URLs.
+              mc anonymous set download local/tanukistore-assets
+
+              # Random, not zeros: MinIO does not compress, but the kernel, the
+              # filesystem and any proxy in the path can all shortcut a run of
+              # zeros, which would inflate throughput into a number that no real
+              # app bundle would ever reproduce.
+              echo "generating 200MB fixture..."
+              head -c 209715200 /dev/urandom > /tmp/asset-200mb.bin
+
+              mc cp /tmp/asset-200mb.bin local/tanukistore-assets/asset-200mb.bin
+              mc ls -r local/tanukistore-assets
+              echo "seed complete"
+          volumeMounts:
+            - { name: scratch, mountPath: /tmp }
+      volumes:
+        # The fixture is staged on node ephemeral storage rather than the
+        # container writable layer, which is neither sized nor meant for it.
+        - name: scratch
+          emptyDir: { sizeLimit: 1Gi }
