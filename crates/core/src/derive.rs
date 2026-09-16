@@ -14,16 +14,22 @@ pub enum DeriveError {
     FilenameHasWhitespace { filename: String },
     #[error("sha1 {sha1:?} for {filename:?} is not 40 hex characters")]
     MalformedSha1 { filename: String, sha1: String },
+    #[error("base_url {base_url:?} must be absolute and start with http:// or https://")]
+    RelativeBaseUrl { base_url: String },
 }
 
 /// The Squirrel.Mac manifest. Field declaration order IS the serialized
 /// order, and the golden fixture asserts on it, so do not reorder.
+///
+/// Private: `derive_latest` returns serialized bytes, so no public function
+/// hands one of these out, and it carries neither `Deserialize` nor
+/// `PartialEq`, which is what a caller would need to do anything with it.
 #[derive(Debug, Serialize)]
-pub struct LatestManifest {
-    pub url: String,
-    pub name: String,
-    pub notes: String,
-    pub pub_date: String,
+struct LatestManifest {
+    url: String,
+    name: String,
+    notes: String,
+    pub_date: String,
 }
 
 /// Derive `latest.json` for a coordinate, or `Ok(None)` when no release is
@@ -42,6 +48,15 @@ pub fn derive_latest(
     coord: &Coordinate,
     base_url: &str,
 ) -> Result<Option<Vec<u8>>, DeriveError> {
+    // Spec 4.7 requires latest.json's `url` to be ABSOLUTE, because
+    // Squirrel.Mac hands it to NSURLSession. An empty or scheme-less base
+    // would yield a relative URL the client cannot use, and nothing
+    // downstream would notice.
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err(DeriveError::RelativeBaseUrl {
+            base_url: base_url.to_owned(),
+        });
+    }
     let Some(release) = resolve::resolve_eligible(index, &coord.app, &coord.channel, None) else {
         return Ok(None);
     };
@@ -171,7 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn matches_the_golden_fixture_byte_for_byte() {
+    fn matches_the_golden_fixture_modulo_the_files_trailing_newline() {
+        // latest-darwin-arm64.json ends with a newline because a text file in
+        // a repo does; the manifest the server emits does not, and must not —
+        // JSON has no trailing-newline convention and the stored bytes are
+        // served verbatim. So the fixture is compared trim_end()-ed, and this
+        // test is NOT byte-for-byte on the file. Its sibling for RELEASES is,
+        // because there a trailing newline terminates the last entry and IS
+        // part of the format.
         let index = Index { releases: vec![zip_release("1.5.0", 100)] };
         let bytes = derive_latest(&index, &coord(), "https://updates.example.com")
             .unwrap()
@@ -195,12 +217,22 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_on_base_url_does_not_double_up() {
+        // Assert the whole URL, not just the absence of "com//": a
+        // substring-absence assertion passes on URLs that are broken in every
+        // other way, which is how raw, unencoded query values survived here.
         let index = Index { releases: vec![zip_release("1.5.0", 100)] };
         let bytes = derive_latest(&index, &coord(), "https://updates.example.com/")
             .unwrap()
             .unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(!text.contains("com//"), "{text}");
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            manifest["url"],
+            serde_json::json!(
+                "https://updates.example.com/download/myapp/1.5.0\
+                 ?platform=darwin&arch=arm64&channel=stable\
+                 &filename=myapp-1.5.0-darwin-arm64.zip"
+            )
+        );
     }
 
     #[test]
@@ -251,6 +283,23 @@ mod tests {
                 kind: AssetKind::Zip,
             })
         );
+    }
+
+    #[test]
+    fn a_relative_base_url_is_an_error() {
+        // Spec 4.7: Squirrel.Mac hands `url` to NSURLSession, so it must be
+        // absolute. A scheme-less base silently produces something the client
+        // cannot fetch.
+        let index = Index { releases: vec![zip_release("1.5.0", 100)] };
+        for base in ["", "updates.example.com", "/download", "ftp://x.example"] {
+            assert_eq!(
+                derive_latest(&index, &coord(), base),
+                Err(DeriveError::RelativeBaseUrl { base_url: base.to_owned() }),
+                "base_url {base:?}"
+            );
+        }
+        assert!(derive_latest(&index, &coord(), "http://updates.example.com").is_ok());
+        assert!(derive_latest(&index, &coord(), "https://updates.example.com").is_ok());
     }
 
     fn nupkg_release(version: &str, sha1: &str, size: u64) -> Release {
