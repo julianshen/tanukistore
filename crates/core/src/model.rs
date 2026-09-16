@@ -100,11 +100,10 @@ pub struct RolloutPct(u8);
 impl RolloutPct {
     pub const FULL: RolloutPct = RolloutPct(100);
 
+    /// Delegates to the `TryFrom<u16>` impl so the 0..=100 bound is stated in
+    /// exactly one place and the two constructors cannot drift apart.
     pub fn new(value: u8) -> Result<Self, ParseError> {
-        if value > 100 {
-            return Err(ParseError::RolloutPct(u16::from(value)));
-        }
-        Ok(RolloutPct(value))
+        Self::try_from(u16::from(value))
     }
 
     pub fn get(&self) -> u8 {
@@ -139,7 +138,7 @@ pub struct Asset {
     pub size_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
     pub version: Version,
     #[serde(default)]
@@ -151,7 +150,7 @@ pub struct Release {
 
 /// The append-only system of record for one app/channel/platform/arch.
 /// Serializes as a bare JSON array to match the on-disk `index.json` shape.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Index {
     pub releases: Vec<Release>,
@@ -170,6 +169,30 @@ mod tests {
         assert_eq!("darwin".parse::<Platform>().unwrap(), Platform::Darwin);
         assert_eq!("arm64".parse::<Arch>().unwrap(), Arch::Arm64);
         assert!("linux".parse::<Platform>().is_err());
+    }
+
+    #[test]
+    fn display_and_serde_agree_on_every_wire_token() {
+        // keys::prefix() builds object keys from Display while index.json is
+        // written and read through serde. They are two parallel encodings of
+        // one token set, and a mismatch would put manifests under a key no
+        // reader looks in. Pin them together.
+        fn serde_token<T: Serialize>(value: &T) -> String {
+            serde_json::to_value(value)
+                .unwrap()
+                .as_str()
+                .expect("these enums serialize as strings")
+                .to_owned()
+        }
+        for platform in [Platform::Darwin, Platform::Win32] {
+            assert_eq!(platform.to_string(), serde_token(&platform));
+        }
+        for arch in [Arch::X64, Arch::Arm64] {
+            assert_eq!(arch.to_string(), serde_token(&arch));
+        }
+        for kind in [AssetKind::Zip, AssetKind::Nupkg, AssetKind::Dmg, AssetKind::Exe] {
+            assert_eq!(kind.to_string(), serde_token(&kind));
+        }
     }
 
     #[test]
