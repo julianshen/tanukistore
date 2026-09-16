@@ -8,7 +8,9 @@ use crate::rollout;
 /// Uses semver ordering via `max_by`, which correctly puts `1.5.0-beta.1`
 /// below `1.5.0`. Note: the semver crate includes build metadata in its Ord
 /// implementation (differing from the semver specification), so versions
-/// differing only in build metadata will order deterministically.
+/// differing only in build metadata order deterministically — per dot-separated
+/// segment, numerically where both segments are all-digits, and with no build
+/// metadata sorting BELOW any. See the characterisation test below.
 pub fn resolve_eligible<'a>(
     index: &'a Index,
     app: &str,
@@ -75,18 +77,44 @@ mod tests {
     fn build_metadata_does_affect_ordering_in_this_crate() {
         // The semver SPECIFICATION says build metadata is not relevant to precedence
         // (https://semver.org/#spec-item-10: "Build metadata SHOULD be ignored when
-        // determining version precedence"). However, the semver CRATE's derived Ord
-        // includes the build field, so 1.5.0+build.1 < 1.5.0+build.2 lexicographically
-        // on the build identifier. This characterises semver 1.0.28 behaviour.
+        // determining version precedence"). The semver CRATE's Ord includes the build
+        // field anyway, so resolve_eligible's max_by is sensitive to it. This test
+        // characterises semver 1.0.28 behaviour; Version::cmp_precedence is the
+        // spec-conformant comparison we are deliberately NOT using.
         //
-        // Consequence: republishing a version with different build metadata silently
-        // changes which release resolves as the newest, potentially downgrading clients.
-        let a = release("1.5.0+build.1", 100);
-        let b = release("1.5.0+build.2", 100);
-        assert_eq!(a.version.cmp(&b.version), std::cmp::Ordering::Less);
-        let index = Index { releases: vec![a, b] };
+        // The ordering is NOT lexicographic on the build string: BuildMetadata::cmp
+        // splits on '.' and compares each segment numerically when both segments are
+        // all-digits (numeric segments also sort below non-numeric ones). Hence
+        // build.9 < build.10, which a lexicographic comparison would reverse.
+        use std::cmp::Ordering;
+        let cmp = |a: &str, b: &str| {
+            Version::parse(a)
+                .unwrap()
+                .cmp(&Version::parse(b).unwrap())
+        };
+        assert_eq!(cmp("1.5.0+build.1", "1.5.0+build.2"), Ordering::Less);
+        assert_eq!(
+            cmp("1.5.0+build.9", "1.5.0+build.10"),
+            Ordering::Less,
+            "segments are compared numerically, not lexicographically"
+        );
+
+        // The sharper tooth: NO build metadata sorts BELOW any build metadata,
+        // because an empty segment counts as all-digits (vacuously) and numeric
+        // sorts below non-numeric. Consequence: a bare 1.5.0 republished after
+        // 1.5.0+build.7 is never picked up — the fleet silently stays on build.7.
+        assert_eq!(cmp("1.5.0", "1.5.0+build.1"), Ordering::Less);
+        let index = Index {
+            releases: vec![release("1.5.0+build.7", 100), release("1.5.0", 100)],
+        };
         let got = resolve_eligible(&index, "myapp", "stable", None).unwrap();
-        // Since b > a due to build metadata ordering, b (1.5.0+build.2) is the max.
+        assert_eq!(got.version, Version::parse("1.5.0+build.7").unwrap());
+
+        // And the max_by consequence for two build-metadata siblings.
+        let index = Index {
+            releases: vec![release("1.5.0+build.1", 100), release("1.5.0+build.2", 100)],
+        };
+        let got = resolve_eligible(&index, "myapp", "stable", None).unwrap();
         assert_eq!(got.version, Version::parse("1.5.0+build.2").unwrap());
     }
 
