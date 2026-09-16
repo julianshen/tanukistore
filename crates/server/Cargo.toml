@@ -1,0 +1,8 @@
+[package]
+name = "tanukistore-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+tanukistore-core = { path = "../core" }

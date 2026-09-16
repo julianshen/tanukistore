@@ -1,8 +1,18 @@
-[package]
-name = "tanukistore"
+[workspace]
+members = ["crates/core", "crates/server", "crates/publish"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Self-hosted Electron autoUpdater server backed by S3-compatible object storage"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+form_urlencoded = "1"
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+url = "2"
