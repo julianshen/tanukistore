@@ -78,6 +78,34 @@ fn pick<'a>(
         })
 }
 
+/// Derive the Squirrel.Windows `RELEASES` manifest: one
+/// `{sha1} {filename} {size}` line per full nupkg, ascending by version.
+///
+/// Unlike `derive_latest`, this walks the ENTIRE index. Squirrel.Windows
+/// compares versions itself and needs a line for whatever version the client
+/// is currently running; emitting only the newest yields a feed that works
+/// for recent clients and silently fails for older ones.
+///
+/// Rollout percentages are ignored for the same reason — withholding a line
+/// cannot stage a rollout on Windows, it only breaks clients on that version.
+/// Windows rollout staging is out of scope for v1.
+///
+/// Filenames are relative, resolved by the client against the feed base URL.
+pub fn derive_releases(index: &Index) -> Result<Vec<u8>, DeriveError> {
+    let mut releases: Vec<&Release> = index.releases.iter().collect();
+    releases.sort_by(|a, b| a.version.cmp(&b.version));
+
+    let mut out = String::new();
+    for release in releases {
+        let asset = pick(release, AssetKind::Nupkg, "nupkg")?;
+        out.push_str(&format!(
+            "{} {} {}\n",
+            asset.sha1, asset.filename, asset.size_bytes
+        ));
+    }
+    Ok(out.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +208,73 @@ mod tests {
         release.assets[0].kind = AssetKind::Dmg;
         let index = Index { releases: vec![release] };
         assert!(derive_latest(&index, &coord(), "https://updates.example.com").is_err());
+    }
+
+    fn nupkg_release(version: &str, sha1: &str, size: u64) -> Release {
+        Release {
+            version: Version::parse(version).unwrap(),
+            notes: String::new(),
+            pub_date: Utc.with_ymd_and_hms(2026, 9, 16, 10, 0, 0).unwrap(),
+            rollout_pct: RolloutPct::FULL,
+            assets: vec![Asset {
+                kind: AssetKind::Nupkg,
+                filename: format!("myapp-{version}-full.nupkg"),
+                sha1: sha1.to_owned(),
+                sha512: "cf83e1357eefb8bd".to_owned(),
+                size_bytes: size,
+            }],
+        }
+    }
+
+    #[test]
+    fn releases_matches_the_golden_fixture_byte_for_byte() {
+        let index = Index {
+            releases: vec![
+                nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 94_371_840),
+                nupkg_release("1.4.0", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d", 93_323_264),
+            ],
+        };
+        let bytes = derive_releases(&index).unwrap();
+        let expected = include_str!("../tests/fixtures/RELEASES-win32-x64");
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn releases_lists_the_whole_history_ascending() {
+        let index = Index {
+            releases: vec![
+                nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 3),
+                nupkg_release("1.4.0", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d", 2),
+                nupkg_release("1.3.0", "0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33", 1),
+            ],
+        };
+        let text = String::from_utf8(derive_releases(&index).unwrap()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "every version must appear: {text}");
+        assert!(lines[0].contains("1.3.0"), "ascending order: {text}");
+        assert!(lines[2].contains("1.5.0"), "ascending order: {text}");
+    }
+
+    #[test]
+    fn releases_includes_partial_rollout_entries() {
+        // Squirrel.Windows does its own comparison, so withholding a line
+        // cannot implement a rollout. The line must be present.
+        let mut staged = nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 3);
+        staged.rollout_pct = RolloutPct::new(10).unwrap();
+        let index = Index { releases: vec![staged] };
+        let text = String::from_utf8(derive_releases(&index).unwrap()).unwrap();
+        assert!(text.contains("1.5.0"), "{text}");
+    }
+
+    #[test]
+    fn releases_is_empty_for_an_empty_index() {
+        let index = Index::default();
+        assert!(derive_releases(&index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn releases_errors_when_a_release_has_no_nupkg() {
+        let index = Index { releases: vec![zip_release("1.5.0", 100)] };
+        assert!(derive_releases(&index).is_err());
     }
 }
