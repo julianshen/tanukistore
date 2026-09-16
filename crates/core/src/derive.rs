@@ -40,17 +40,8 @@ pub fn derive_latest(
         return Ok(None);
     };
     let asset = pick(release, AssetKind::Zip, "zip")?;
-    let base = base_url.trim_end_matches('/');
     let manifest = LatestManifest {
-        url: format!(
-            "{base}/download/{app}/{version}?platform={platform}&arch={arch}&channel={channel}&filename={filename}",
-            app = coord.app,
-            version = release.version,
-            platform = coord.platform,
-            arch = coord.arch,
-            channel = coord.channel,
-            filename = asset.filename,
-        ),
+        url: coord.download_url(base_url, &release.version, &asset.filename),
         name: release.version.to_string(),
         notes: release.notes.clone(),
         pub_date: release
