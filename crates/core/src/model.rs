@@ -156,9 +156,50 @@ pub struct Index {
     pub releases: Vec<Release>,
 }
 
+/// Per-app `config.json` (spec 5): which channels exist and which one a client
+/// gets when its request names none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub channels: Vec<String>,
+    #[serde(rename = "defaultChannel")]
+    pub default_channel: String,
+}
+
+impl AppConfig {
+    /// The channel a request should be served from: the one it named, if the
+    /// app has it, else the default. `None` means the request named a channel
+    /// this app does not have, which is a 404 rather than a silent fallback -
+    /// quietly serving `stable` to a client that asked for `beta` would hide a
+    /// misconfigured feed URL forever.
+    pub fn resolve_channel<'a>(&'a self, requested: Option<&'a str>) -> Option<&'a str> {
+        match requested {
+            None => Some(self.default_channel.as_str()),
+            Some(channel) => self
+                .channels
+                .iter()
+                .any(|c| c == channel)
+                .then_some(channel),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_config_resolves_the_requested_or_default_channel() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"channels":["stable","beta"],"defaultChannel":"stable"}"#)
+                .unwrap();
+        assert_eq!(config.resolve_channel(None), Some("stable"));
+        assert_eq!(config.resolve_channel(Some("beta")), Some("beta"));
+        assert_eq!(config.resolve_channel(Some("nightly")), None);
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            r#"{"channels":["stable","beta"],"defaultChannel":"stable"}"#
+        );
+    }
 
     #[test]
     fn platform_and_arch_render_as_wire_tokens() {

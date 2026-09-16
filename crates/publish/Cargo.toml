@@ -5,4 +5,20 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-tanukistore-core = { path = "../core" }
+anyhow.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+semver.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tanukistore-core = { path = "../core", features = ["s3"] }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
