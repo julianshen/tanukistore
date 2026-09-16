@@ -4,29 +4,129 @@ use semver::Version;
 
 use crate::model::{Arch, Platform};
 
-/// One app/channel/platform/arch combination — the unit that owns an
+/// Why an operator-supplied `app` or `channel` cannot be used in a key.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CoordinateError {
+    #[error("{field} must not be empty")]
+    Empty { field: &'static str },
+    #[error(
+        "{field} {value:?} contains {ch:?}; only ASCII letters, digits, '.', '_' and '-' are allowed"
+    )]
+    IllegalCharacter {
+        field: &'static str,
+        value: String,
+        ch: char,
+    },
+    #[error("{field} {value:?} is a relative path component")]
+    RelativePathComponent { field: &'static str, value: String },
+}
+
+/// Check that a value is usable as an `app` or `channel` everywhere the
+/// protocol interpolates one.
+///
+/// These two strings are operator-supplied and reach four sinks, each with a
+/// different separator that must not appear in them:
+///
+/// - the object key `{app}/{channel}/{platform}/{arch}/...` (spec 5). Without
+///   this check `(app="a/b", channel="c")` and `(app="a", channel="b/c")`
+///   produce the SAME prefix, so two apps silently share - and overwrite -
+///   each other's index, manifests and assets.
+/// - the `/download/:app/:version` route, where `app` is one path segment, so
+///   a `/`, `?` or `#` changes the route's shape rather than its contents.
+/// - the rollout bucket hash over `{app}:{channel}:{id}`
+///   ([`crate::rollout::bucket`], a frozen wire contract), where a `:` makes
+///   `("a:b", "c")` and `("a", "b:c")` hash identically and therefore share a
+///   rollout cohort.
+/// - the NATS subject `updates.versioncheck.{app}.{uid}.{channel}.{platform}`
+///   (spec 9), where `.`, ` `, `*` and `>` are all structural.
+///
+/// The allowlist is `[A-Za-z0-9._-]`, chosen over the stricter `[A-Za-z0-9_-]`
+/// so that a reverse-DNS appId such as `com.example.app` - Electron's own
+/// convention, and what most operators will already have - remains usable.
+///
+/// UNRESOLVED, and the price of admitting `.`: an app containing dots expands
+/// into several NATS subject tokens, so the per-user replay filter spec 9
+/// documents as `updates.versioncheck.*.{uid}.>` no longer matches it. Spec 9
+/// needs to either encode the app token or widen that filter. Nothing in this
+/// crate publishes NATS subjects yet, so the gap is not live, but it must be
+/// closed before the observability path ships.
+///
+/// `.` and `..` are rejected outright: they are legal under the allowlist but
+/// are relative path components, and an `app` of `..` escapes the key prefix
+/// wherever a key is used as a path - which the local disk cache tier does.
+pub fn validate_segment(field: &'static str, value: &str) -> Result<(), CoordinateError> {
+    if value.is_empty() {
+        return Err(CoordinateError::Empty { field });
+    }
+    if value == "." || value == ".." {
+        return Err(CoordinateError::RelativePathComponent {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    match value
+        .chars()
+        .find(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+    {
+        Some(ch) => Err(CoordinateError::IllegalCharacter {
+            field,
+            value: value.to_owned(),
+            ch,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// One app/channel/platform/arch combination - the unit that owns an
 /// `index.json` and its two derived manifests.
+///
+/// Fields are private so that [`Coordinate::new`] is the only way to build
+/// one. A `pub` field would let a caller assemble an unvalidated coordinate
+/// with a struct literal and walk straight past [`validate_segment`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Coordinate {
-    pub app: String,
-    pub channel: String,
-    pub platform: Platform,
-    pub arch: Arch,
+    app: String,
+    channel: String,
+    platform: Platform,
+    arch: Arch,
 }
 
 impl Coordinate {
+    /// Build a coordinate, rejecting an `app` or `channel` that cannot be
+    /// interpolated unambiguously. See [`validate_segment`] for what "cannot"
+    /// means and why this is fallible at all.
     pub fn new(
         app: impl Into<String>,
         channel: impl Into<String>,
         platform: Platform,
         arch: Arch,
-    ) -> Self {
-        Coordinate {
-            app: app.into(),
-            channel: channel.into(),
+    ) -> Result<Self, CoordinateError> {
+        let app = app.into();
+        let channel = channel.into();
+        validate_segment("app", &app)?;
+        validate_segment("channel", &channel)?;
+        Ok(Coordinate {
+            app,
+            channel,
             platform,
             arch,
-        }
+        })
+    }
+
+    pub fn app(&self) -> &str {
+        &self.app
+    }
+
+    pub fn channel(&self) -> &str {
+        &self.channel
+    }
+
+    pub fn platform(&self) -> Platform {
+        self.platform
+    }
+
+    pub fn arch(&self) -> Arch {
+        self.arch
     }
 
     pub fn prefix(&self) -> String {
@@ -71,11 +171,12 @@ impl Coordinate {
     ///   TO A SPACE under form-urlencoding, so the handler would rebuild a
     ///   different object key and 404.
     ///
-    /// `app` and `version` are interpolated into the path unencoded: `version`
-    /// is a `semver::Version`, whose grammar admits only alphanumerics, `-`,
-    /// `.` and `+` (all legal in a path segment, and `+` is not space-decoded
-    /// there), and `app` is a bucket key segment (spec 5) constrained by the
-    /// publisher.
+    /// `app` and `version` are interpolated into the path unencoded, and both
+    /// are safe there by construction rather than by convention: `version` is a
+    /// `semver::Version`, whose grammar admits only alphanumerics, `-`, `.` and
+    /// `+` (all legal in a path segment, and `+` is not space-decoded there),
+    /// and `app` passed [`validate_segment`] at construction, whose allowlist
+    /// `[A-Za-z0-9._-]` is a subset of the unreserved path characters.
     pub fn download_url(&self, base_url: &str, version: &Version, filename: &str) -> String {
         let base = base_url.trim_end_matches('/');
         let app = &self.app;
@@ -92,8 +193,11 @@ impl Coordinate {
     }
 }
 
-pub fn config_key(app: &str) -> String {
-    format!("{app}/config.json")
+/// The per-app config object (spec 5). Fallible for the same reason
+/// [`Coordinate::new`] is: `app` is operator-supplied and becomes a key prefix.
+pub fn config_key(app: &str) -> Result<String, CoordinateError> {
+    validate_segment("app", app)?;
+    Ok(format!("{app}/config.json"))
 }
 
 /// Bounded classification of cacheable objects, used as the `key_kind`
@@ -123,7 +227,7 @@ mod tests {
     use crate::model::{Arch, Platform};
 
     fn coord() -> Coordinate {
-        Coordinate::new("myapp", "stable", Platform::Darwin, Arch::Arm64)
+        Coordinate::new("myapp", "stable", Platform::Darwin, Arch::Arm64).unwrap()
     }
 
     #[test]
@@ -137,7 +241,7 @@ mod tests {
             c.asset_key(&semver::Version::new(1, 5, 0), "app.zip"),
             "myapp/stable/darwin/arm64/1.5.0/app.zip"
         );
-        assert_eq!(config_key("myapp"), "myapp/config.json");
+        assert_eq!(config_key("myapp").unwrap(), "myapp/config.json");
     }
 
     /// Split an emitted download URL back into the pieces a download handler
@@ -180,7 +284,8 @@ mod tests {
             query_value(&pairs, "channel"),
             query_value(&pairs, "platform").parse::<Platform>().unwrap(),
             query_value(&pairs, "arch").parse::<Arch>().unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(rebuilt, c, "{url}");
         assert_eq!(
             rebuilt.asset_key(
@@ -245,6 +350,118 @@ mod tests {
             c.download_url("https://updates.example.com/", &version, "app.zip"),
             c.download_url("https://updates.example.com", &version, "app.zip")
         );
+    }
+
+    #[test]
+    fn a_separator_in_app_or_channel_is_rejected() {
+        // The collision this exists to prevent: with an unvalidated `/`, these
+        // two DIFFERENT coordinates produce the SAME object prefix, so each
+        // app reads and overwrites the other's index, manifests and assets.
+        assert_eq!(
+            format!("{}/{}/darwin/arm64", "a/b", "c"),
+            format!("{}/{}/darwin/arm64", "a", "b/c"),
+            "the ambiguity is real, which is why both inputs must be refused"
+        );
+        for (app, channel, field, value) in [
+            ("a/b", "c", "app", "a/b"),
+            ("a", "b/c", "channel", "b/c"),
+        ] {
+            assert_eq!(
+                Coordinate::new(app, channel, Platform::Darwin, Arch::Arm64),
+                Err(CoordinateError::IllegalCharacter {
+                    field,
+                    value: value.to_owned(),
+                    ch: '/',
+                })
+            );
+        }
+
+        // One representative per sink, so a future widening of the allowlist
+        // has to take each of these deliberately rather than by accident.
+        let illegal = [
+            ('/', "the object key and the /download/:app path segment"),
+            (':', "the {app}:{channel}:{id} rollout bucket hash"),
+            (' ', "the NATS subject, and NSURL(string:)"),
+            ('*', "the NATS subject wildcard"),
+            ('>', "the NATS subject wildcard"),
+            ('?', "the /download query string"),
+            ('#', "a URL fragment"),
+            ('%', "percent-encoding"),
+        ];
+        for (ch, why) in illegal {
+            let app = format!("my{ch}app");
+            assert_eq!(
+                Coordinate::new(&app, "stable", Platform::Darwin, Arch::Arm64),
+                Err(CoordinateError::IllegalCharacter {
+                    field: "app",
+                    value: app.clone(),
+                    ch,
+                }),
+                "{ch:?} must be rejected: it is structural in {why}"
+            );
+            assert!(
+                config_key(&app).is_err(),
+                "config_key takes the same operator-supplied app: {app:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_path_component_is_rejected() {
+        // Legal under the [A-Za-z0-9._-] allowlist, but `..` escapes the key
+        // prefix anywhere a key is used as a filesystem path - which the local
+        // disk cache tier does.
+        for value in [".", ".."] {
+            assert_eq!(
+                Coordinate::new(value, "stable", Platform::Darwin, Arch::Arm64),
+                Err(CoordinateError::RelativePathComponent {
+                    field: "app",
+                    value: value.to_owned(),
+                })
+            );
+            assert_eq!(
+                Coordinate::new("myapp", value, Platform::Darwin, Arch::Arm64),
+                Err(CoordinateError::RelativePathComponent {
+                    field: "channel",
+                    value: value.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_app_or_channel_is_rejected() {
+        // "" would collapse the prefix to `/stable/darwin/arm64`, colliding
+        // with every other empty-app coordinate.
+        assert_eq!(
+            Coordinate::new("", "stable", Platform::Darwin, Arch::Arm64),
+            Err(CoordinateError::Empty { field: "app" })
+        );
+        assert_eq!(
+            Coordinate::new("myapp", "", Platform::Darwin, Arch::Arm64),
+            Err(CoordinateError::Empty { field: "channel" })
+        );
+        assert_eq!(config_key(""), Err(CoordinateError::Empty { field: "app" }));
+    }
+
+    #[test]
+    fn the_names_operators_actually_use_are_accepted() {
+        // `.` is in the allowlist specifically so Electron's reverse-DNS appId
+        // convention keeps working. See `validate_segment`'s UNRESOLVED note on
+        // what that costs the NATS subject hierarchy.
+        for app in ["myapp", "my-app", "my_app_2", "com.example.app", "MyApp"] {
+            assert!(
+                Coordinate::new(app, "stable", Platform::Darwin, Arch::Arm64).is_ok(),
+                "{app:?}"
+            );
+            assert!(config_key(app).is_ok(), "{app:?}");
+        }
+        for channel in ["stable", "beta", "next-rc", "1.x"] {
+            assert!(
+                Coordinate::new("myapp", channel, Platform::Darwin, Arch::Arm64).is_ok(),
+                "{channel:?}"
+            );
+        }
     }
 
     #[test]

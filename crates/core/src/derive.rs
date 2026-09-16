@@ -1,4 +1,5 @@
 use serde::Serialize;
+use url::{ParseError, Url};
 
 use crate::keys::Coordinate;
 use crate::model::{AssetKind, Index, Release};
@@ -42,6 +43,65 @@ struct LatestManifest {
     pub_date: String,
 }
 
+/// Check that `base_url` can actually be joined into an absolute download URL.
+///
+/// Spec 4.7 requires `latest.json`'s `url` to be ABSOLUTE, because Squirrel.Mac
+/// hands it to `NSURLSession`.
+///
+/// This PARSES rather than pattern-matches, because every cheaper check has a
+/// hole: `"https://"` satisfies a `starts_with("https://")` yet has no
+/// authority, and `"https://:443"` satisfies "the first slash-delimited
+/// substring is non-empty" yet still has no host.
+///
+/// The round-trip against [`Url::as_str`] is the load-bearing part, and the
+/// reason parsing alone is not enough. [`crate::keys::Coordinate::download_url`]
+/// formats with the RAW string, never with anything parsed, so validating only
+/// the parse would let the two disagree: `"https:///download"` parses as host
+/// `download` (the URL grammar collapses the extra slash), and
+/// `"https://ex ample.com/"` parses only because the space is percent-encoded
+/// on the way in - the same raw space that makes `NSURL(string:)` return nil,
+/// silently stopping every macOS update. Demanding the input already be in
+/// normalized form is what makes "the string we validated" and "the string we
+/// emit" provably the same string.
+///
+/// Exposed so the publisher can reject a bad configuration at startup rather
+/// than at the first derive.
+pub fn validate_base_url(base_url: &str) -> Result<(), DeriveError> {
+    let unusable = |reason: &'static str| DeriveError::UnusableBaseUrl {
+        base_url: base_url.to_owned(),
+        reason,
+    };
+    let parsed = Url::parse(base_url).map_err(|err| match err {
+        ParseError::RelativeUrlWithoutBase => unusable("must start with http:// or https://"),
+        ParseError::EmptyHost => unusable("has a scheme but no host"),
+        ParseError::InvalidPort => unusable("has an invalid port"),
+        _ => unusable("has an unparseable host"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(unusable("must start with http:// or https://"));
+    }
+    // A query or fragment on the base is unjoinable - `download_url` appends
+    // the path and its own query AFTER it, so both would land in the wrong
+    // place.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(unusable("must not carry a query string or fragment"));
+    }
+    // Credentials would be copied verbatim into latest.json, an object served
+    // to the entire fleet and cached at every tier.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(unusable("must not carry credentials"));
+    }
+    // Compared with trailing slashes stripped because `download_url` strips
+    // them too, so that difference alone is not a divergence.
+    if parsed.as_str().trim_end_matches('/') != base_url.trim_end_matches('/') {
+        return Err(unusable(
+            "is not in normalized form - give scheme, host, optional non-default port and path \
+             only, with no redundant slashes, percent-escapes, spaces or uppercase host",
+        ));
+    }
+    Ok(())
+}
+
 /// Derive `latest.json` for a coordinate, or `Ok(None)` when no release is
 /// available to every client.
 ///
@@ -63,47 +123,13 @@ struct LatestManifest {
 /// `url` points at tanukistore's own download route rather than a presigned
 /// MinIO URL (spec 4.7), which is what keeps these bytes static and lets the
 /// server return them without re-serializing.
-/// Check that `base_url` can actually be joined into an absolute download URL.
-///
-/// Spec 4.7 requires `latest.json`'s `url` to be ABSOLUTE, because Squirrel.Mac
-/// hands it to `NSURLSession`. A scheme prefix alone does not guarantee that:
-/// `"https://"` starts with `https://` yet has no authority, and
-/// [`crate::keys::Coordinate::download_url`] would trim its trailing slashes
-/// and emit `https:/download/...`, which no client can fetch. A query or
-/// fragment on the base is likewise unjoinable - it would land before the path.
-///
-/// Exposed so the publisher can reject a bad configuration at startup rather
-/// than at the first derive.
-pub fn validate_base_url(base_url: &str) -> Result<(), DeriveError> {
-    let unusable = |reason: &'static str| DeriveError::UnusableBaseUrl {
-        base_url: base_url.to_owned(),
-        reason,
-    };
-    let authority_and_path = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .ok_or_else(|| unusable("must start with http:// or https://"))?;
-    if authority_and_path
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .is_empty()
-    {
-        return Err(unusable("has a scheme but no host"));
-    }
-    if base_url.contains('?') || base_url.contains('#') {
-        return Err(unusable("must not carry a query string or fragment"));
-    }
-    Ok(())
-}
-
 pub fn derive_latest(
     index: &Index,
     coord: &Coordinate,
     base_url: &str,
 ) -> Result<Option<Vec<u8>>, DeriveError> {
     validate_base_url(base_url)?;
-    let Some(release) = resolve::resolve_eligible(index, &coord.app, &coord.channel, None) else {
+    let Some(release) = resolve::resolve_eligible(index, coord.app(), coord.channel(), None) else {
         return Ok(None);
     };
     let asset = pick(release, AssetKind::Zip)?;
@@ -228,7 +254,7 @@ mod tests {
     use semver::Version;
 
     fn coord() -> Coordinate {
-        Coordinate::new("myapp", "stable", Platform::Darwin, Arch::Arm64)
+        Coordinate::new("myapp", "stable", Platform::Darwin, Arch::Arm64).unwrap()
     }
 
     fn zip_release(version: &str, pct: u8) -> Release {
@@ -348,48 +374,85 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_base_url_is_an_error() {
+    fn a_base_url_that_cannot_be_joined_is_an_error() {
         // Spec 4.7: Squirrel.Mac hands `url` to NSURLSession, so it must be
-        // absolute. A scheme-less base silently produces something the client
-        // cannot fetch.
-        let index = Index { releases: vec![zip_release("1.5.0", 100)] };
+        // absolute. Each group below is a distinct way the join breaks, and
+        // every one of them used to pass some earlier, cheaper check.
+        let index = Index {
+            releases: vec![zip_release("1.5.0", 100)],
+        };
+        let rejects = |base: &str, reason: &'static str| {
+            assert_eq!(
+                derive_latest(&index, &coord(), base),
+                Err(DeriveError::UnusableBaseUrl {
+                    base_url: base.to_owned(),
+                    reason,
+                }),
+                "base_url {base:?}"
+            );
+        };
+
+        // No usable scheme at all.
         for base in ["", "updates.example.com", "/download", "ftp://x.example"] {
-            assert_eq!(
-                derive_latest(&index, &coord(), base),
-                Err(DeriveError::UnusableBaseUrl {
-                    base_url: base.to_owned(),
-                    reason: "must start with http:// or https://",
-                }),
-                "base_url {base:?}"
-            );
+            rejects(base, "must start with http:// or https://");
         }
-        // A scheme prefix alone is not enough: these pass a `starts_with`
-        // check and still cannot be joined into a fetchable URL.
-        for base in ["https://", "http://", "https:///download"] {
-            assert_eq!(
-                derive_latest(&index, &coord(), base),
-                Err(DeriveError::UnusableBaseUrl {
-                    base_url: base.to_owned(),
-                    reason: "has a scheme but no host",
-                }),
-                "base_url {base:?}"
-            );
+        // A scheme prefix alone is not enough - these pass `starts_with`.
+        for base in ["https://", "http://"] {
+            rejects(base, "has a scheme but no host");
+        }
+        // A NON-EMPTY authority is not enough either: `https://:443` has a
+        // non-empty first slash-delimited substring, so it survived the
+        // previous "first segment is non-empty" check while having no host.
+        rejects("https://:443", "has a scheme but no host");
+        for base in [
+            "https://updates.example.com:bad",
+            "https://updates.example.com:99999",
+        ] {
+            rejects(base, "has an invalid port");
         }
         for base in [
             "https://updates.example.com/?x=1",
             "https://updates.example.com#frag",
         ] {
-            assert_eq!(
-                derive_latest(&index, &coord(), base),
-                Err(DeriveError::UnusableBaseUrl {
-                    base_url: base.to_owned(),
-                    reason: "must not carry a query string or fragment",
-                }),
+            rejects(base, "must not carry a query string or fragment");
+        }
+        // latest.json is served to the whole fleet and cached at every tier.
+        rejects(
+            "https://user:pw@updates.example.com",
+            "must not carry credentials",
+        );
+
+        let not_normalized = "is not in normalized form - give scheme, host, optional non-default \
+                              port and path only, with no redundant slashes, percent-escapes, \
+                              spaces or uppercase host";
+        for base in [
+            // Parses as host `download` - the URL grammar collapses the extra
+            // slash - so a parse-only check would accept an obvious typo.
+            "https:///download",
+            // Parses only by percent-encoding the space; emitted raw, that
+            // space makes NSURL(string:) return nil and updates stop silently.
+            "https://updates.example.com/a b",
+            "HTTPS://Updates.Example.COM",
+            "https://ex%61mple.com",
+        ] {
+            rejects(base, not_normalized);
+        }
+
+        // The forms an operator actually configures, including a subpath, an
+        // explicit non-default port and an IPv6 literal.
+        for base in [
+            "http://updates.example.com",
+            "https://updates.example.com",
+            "https://updates.example.com/",
+            "https://updates.example.com/base",
+            "https://updates.example.com:8443",
+            "https://[::1]:8080",
+        ] {
+            assert!(
+                derive_latest(&index, &coord(), base).is_ok(),
                 "base_url {base:?}"
             );
         }
-        assert!(derive_latest(&index, &coord(), "http://updates.example.com").is_ok());
-        assert!(derive_latest(&index, &coord(), "https://updates.example.com").is_ok());
     }
 
     fn nupkg_release(version: &str, sha1: &str, size: u64) -> Release {

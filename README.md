@@ -20,8 +20,18 @@ Early scaffold. The architecture and wire-protocol analysis live in
 
 ## Development
 
+The repository is a virtual workspace: `tanukistore-core` holds the pure
+protocol logic, and `tanukistore-server` and `tanukistore-publish` are the two
+binaries. Because there are two binaries, the root commands name their scope
+explicitly.
+
 ```sh
-cargo run     # start the binary
-cargo test    # run tests
-cargo clippy  # lint
+cargo run -p tanukistore-server        # start the server
+cargo test --workspace                 # run tests
+cargo clippy --workspace --all-targets # lint
 ```
+
+Scope is spelled out rather than set once via `default-members`, which would
+make bare `cargo run` work but would also narrow `cargo test` and `cargo clippy`
+to that same member — quietly dropping every test in `tanukistore-core`, which
+is where all of them currently live.
