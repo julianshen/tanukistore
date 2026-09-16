@@ -1,0 +1,81 @@
+# tanukistore-server on k3s.
+#
+# Image is built on the node and pushed to the node-local registry:
+#   docker build -t localhost:5000/tanukistore:0.2.0 . && docker push localhost:5000/tanukistore:0.2.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tanukistore
+  namespace: tanukistore
+  labels: { app: tanukistore }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: tanukistore }
+  template:
+    metadata:
+      labels: { app: tanukistore }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: server
+          image: localhost:5000/tanukistore:0.2.0
+          env:
+            - { name: S3_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
+            # Where clients will fetch presigned URLs from. In-cluster for now;
+            # for real clients this must be the PUBLIC MinIO host, because the
+            # SigV4 signature covers the Host header.
+            - { name: S3_PRESIGN_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
+            - { name: S3_BUCKET, value: tanukistore }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tanukistore-server-s3, key: access-key } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tanukistore-server-s3, key: secret-key } }
+          ports:
+            - { name: public, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+          # Probes on the ADMIN listener, which is never exposed publicly.
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 250m, memory: 64Mi }
+            # One core, deliberately. The load test measures how much ONE core
+            # of tanukistore serves; a larger limit on a shared 16-core node
+            # would let the load generator become the bottleneck instead.
+            limits: { cpu: "1", memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+# The update feed. Only this Service belongs behind an ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tanukistore
+  namespace: tanukistore
+spec:
+  selector: { app: tanukistore }
+  ports:
+    - { name: public, port: 8080, targetPort: public }
+---
+# Metrics and probes (spec 6.1). Separate Service so the admin port can never
+# ride along when the public one is exposed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tanukistore-admin
+  namespace: tanukistore
+spec:
+  selector: { app: tanukistore }
+  ports:
+    - { name: admin, port: 9090, targetPort: admin }

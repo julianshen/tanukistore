@@ -1,0 +1,58 @@
+# Publishes two releases of a synthetic 200MB app through tanukistore-publish,
+# so the server has a real feed to serve: darwin/arm64 (Squirrel.Mac zip) and
+# win32/x64 (full nupkg), versions 1.0.0 then 1.1.0.
+#
+# Uses the WRITE identity. Re-runnable: already-published versions are refused
+# by the publisher, which the script tolerates.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tanukistore-publish-demo
+  namespace: tanukistore
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: publish
+          image: localhost:5000/tanukistore:0.2.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cd /work
+              for v in 1.0.0 1.1.0; do
+                # Random bytes: realistic for compressed bundles, and nothing in
+                # the path can shortcut them.
+                head -c 209715200 /dev/urandom > "DemoApp-$v-mac.zip"
+                head -c 209715200 /dev/urandom > "DemoApp-$v-full.nupkg"
+                echo "release notes for $v" > notes.md
+                tanukistore-publish release \
+                  --app demoapp --channel stable --version "$v" \
+                  --notes-file notes.md \
+                  --target "darwin/arm64=DemoApp-$v-mac.zip" \
+                  --target "win32/x64=DemoApp-$v-full.nupkg" \
+                  || echo "release $v not published (already exists?)"
+                rm -f "DemoApp-$v-mac.zip" "DemoApp-$v-full.nupkg"
+              done
+          env:
+            - { name: S3_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
+            - { name: S3_BUCKET, value: tanukistore }
+            - { name: TANUKI_BASE_URL, value: "http://tanukistore.tanukistore.svc.cluster.local:8080" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: tanukistore-publish-s3, key: access-key } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: tanukistore-publish-s3, key: secret-key } }
+          resources:
+            requests: { cpu: 500m, memory: 128Mi }
+            limits: { cpu: "2", memory: 512Mi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 1Gi }

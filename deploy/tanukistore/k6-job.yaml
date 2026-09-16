@@ -1,0 +1,37 @@
+# Runs loadtest/tanukistore.js in-cluster against the tanukistore Service.
+#   kubectl -n tanukistore create configmap k6-tanukistore \
+#     --from-file=loadtest/tanukistore.js --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n tanukistore delete job k6-tanukistore --ignore-not-found
+#   kubectl -n tanukistore apply -f deploy/tanukistore/k6-job.yaml
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-tanukistore
+  namespace: tanukistore
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { app: k6-tanukistore }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6:0.58.0
+          args: ["run", "/scripts/tanukistore.js"]
+          env:
+            - { name: MODE, value: "stepped" }
+            - { name: RATE, value: "1000" }
+            - { name: DURATION, value: "40s" }
+          resources:
+            requests: { cpu: "2", memory: 512Mi }
+            # 8 cores against a server capped at 1. The MinIO runs showed a
+            # 4-core k6 becoming the ceiling; for small requests the generator
+            # needs far more headroom than the thing it is measuring.
+            limits: { cpu: "8", memory: 4Gi }
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      volumes:
+        - name: scripts
+          configMap: { name: k6-tanukistore }

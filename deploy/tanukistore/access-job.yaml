@@ -1,0 +1,84 @@
+# Creates tanukistore's private bucket and its two MinIO identities.
+#
+# Two accounts is a security boundary, not tidiness (spec 7): the server can
+# only READ, so "there is no write route" is enforced by MinIO rather than by
+# code review. Only the publisher can change what clients are offered.
+#
+# Credentials are generated out of band and never reach git:
+#   for who in server publish; do
+#     kubectl -n tanukistore create secret generic tanukistore-$who-s3 \
+#       --from-literal=access-key=tanuki-$who \
+#       --from-literal=secret-key="$(openssl rand -hex 24)"
+#   done
+#   kubectl -n tanukistore apply -f deploy/tanukistore/access-job.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tanukistore-policies
+  namespace: tanukistore
+data:
+  server-readonly.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow", "Action": ["s3:GetObject"],
+          "Resource": ["arn:aws:s3:::tanukistore/*"] }
+      ]
+    }
+  publish-readwrite.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+          "Resource": ["arn:aws:s3:::tanukistore/*"] },
+        { "Effect": "Allow", "Action": ["s3:ListBucket"],
+          "Resource": ["arn:aws:s3:::tanukistore"] }
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tanukistore-access
+  namespace: tanukistore
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+          env:
+            - { name: ROOT_USER, valueFrom: { secretKeyRef: { name: minio-credentials, key: root-user } } }
+            - { name: ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: minio-credentials, key: root-password } } }
+            - { name: SERVER_KEY, valueFrom: { secretKeyRef: { name: tanukistore-server-s3, key: access-key } } }
+            - { name: SERVER_SECRET, valueFrom: { secretKeyRef: { name: tanukistore-server-s3, key: secret-key } } }
+            - { name: PUBLISH_KEY, valueFrom: { secretKeyRef: { name: tanukistore-publish-s3, key: access-key } } }
+            - { name: PUBLISH_SECRET, valueFrom: { secretKeyRef: { name: tanukistore-publish-s3, key: secret-key } } }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # mc keeps its config under $HOME, and the image's HOME is not
+              # writable for an arbitrary UID.
+              export HOME=/tmp
+              mc alias set local http://minio:9000 "$ROOT_USER" "$ROOT_PASSWORD"
+              # Private: no anonymous policy. Clients only ever reach objects
+              # through URLs the server presigns.
+              mc mb --ignore-existing local/tanukistore
+              mc admin policy create local tanukistore-server-ro /policies/server-readonly.json
+              mc admin policy create local tanukistore-publish-rw /policies/publish-readwrite.json
+              mc admin user add local "$SERVER_KEY" "$SERVER_SECRET"
+              mc admin user add local "$PUBLISH_KEY" "$PUBLISH_SECRET"
+              # attach is not idempotent; re-running must not fail the Job.
+              mc admin policy attach local tanukistore-server-ro --user "$SERVER_KEY" || true
+              mc admin policy attach local tanukistore-publish-rw --user "$PUBLISH_KEY" || true
+              mc admin user info local "$SERVER_KEY"
+              mc admin user info local "$PUBLISH_KEY"
+          volumeMounts:
+            - { name: policies, mountPath: /policies }
+      volumes:
+        - name: policies
+          configMap: { name: tanukistore-policies }
