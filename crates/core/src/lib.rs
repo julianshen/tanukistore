@@ -4,3 +4,4 @@
 pub mod model;
 pub mod keys;
 pub mod rollout;
+pub mod resolve;
