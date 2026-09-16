@@ -8,6 +8,12 @@ use crate::resolve;
 pub enum DeriveError {
     #[error("release {version} has no {kind} asset")]
     NoAsset { version: String, kind: AssetKind },
+    #[error("two index entries share version {version}")]
+    DuplicateVersion { version: String },
+    #[error("filename {filename:?} contains whitespace, which the RELEASES line format cannot represent")]
+    FilenameHasWhitespace { filename: String },
+    #[error("sha1 {sha1:?} for {filename:?} is not 40 hex characters")]
+    MalformedSha1 { filename: String, sha1: String },
 }
 
 /// The Squirrel.Mac manifest. Field declaration order IS the serialized
@@ -66,7 +72,15 @@ fn pick(release: &Release, kind: AssetKind) -> Result<&crate::model::Asset, Deri
 }
 
 /// Derive the Squirrel.Windows `RELEASES` manifest: one
-/// `{sha1} {filename} {size}` line per full nupkg, ascending by version.
+/// `{sha1} {filename} {size}` line per nupkg asset in the index, ascending by
+/// version.
+///
+/// **Full-vs-delta is a caller-enforced obligation this function cannot
+/// check.** Spec 5 says `RELEASES` lists every *full* nupkg, but `AssetKind`
+/// has no full/delta distinction, so a delta nupkg recorded in `index.json`
+/// is emitted here as an ordinary, unmarked line. Keeping deltas out of the
+/// index (or out of the nupkg kind) is the publisher's job under spec 4.5;
+/// nothing below detects a violation.
 ///
 /// Unlike `derive_latest`, this walks the ENTIRE index. Squirrel.Windows
 /// compares versions itself and needs a line for whatever version the client
@@ -83,8 +97,44 @@ pub fn derive_releases(index: &Index) -> Result<Vec<u8>, DeriveError> {
     releases.sort_by(|a, b| a.version.cmp(&b.version));
 
     let mut out = String::new();
+    let mut previous: Option<&Release> = None;
     for release in releases {
+        // Equal versions are adjacent after the sort. Two entries sharing a
+        // version emit two lines with the same version and conflicting
+        // SHA-1/size; Squirrel.Windows checksum-verifies whichever it picked,
+        // fails, deletes the package and re-downloads forever. Duplicate
+        // input is reachable — a hand edit, a backup restore, a concurrent
+        // --force — which is exactly the class of out-of-band write spec 4.3
+        // says the design must catch. Fail loudly at publish time instead.
+        if let Some(previous) = previous
+            && previous.version == release.version
+        {
+            return Err(DeriveError::DuplicateVersion {
+                version: release.version.to_string(),
+            });
+        }
+        previous = Some(release);
+
         let asset = pick(release, AssetKind::Nupkg)?;
+        // Squirrel.Windows' entry parser matches the filename field as (\S+)
+        // and THROWS on a line it cannot match, and that propagates out of
+        // parsing the whole file. So one filename containing a space breaks
+        // the entire feed for every version and every Windows client, and a
+        // newline would inject a fabricated entry. Spec 4.5 assigns filename
+        // validation to the publisher, but this is the last pure gate before
+        // bytes reach the wire.
+        if asset.filename.chars().any(char::is_whitespace) {
+            return Err(DeriveError::FilenameHasWhitespace {
+                filename: asset.filename.clone(),
+            });
+        }
+        if asset.sha1.len() != 40 || !asset.sha1.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(DeriveError::MalformedSha1 {
+                filename: asset.filename.clone(),
+                sha1: asset.sha1.clone(),
+            });
+        }
+
         out.push_str(&format!(
             "{} {} {}\n",
             asset.sha1, asset.filename, asset.size_bytes
@@ -263,6 +313,75 @@ mod tests {
     fn releases_is_empty_for_an_empty_index() {
         let index = Index::default();
         assert!(derive_releases(&index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn releases_rejects_two_entries_sharing_a_version() {
+        // Two lines for one version with conflicting SHA-1s makes
+        // Squirrel.Windows checksum-fail, delete and re-download forever.
+        let index = Index {
+            releases: vec![
+                nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 1),
+                nupkg_release("1.5.0", "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d", 2),
+            ],
+        };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::DuplicateVersion { version: "1.5.0".to_owned() })
+        );
+    }
+
+    #[test]
+    fn releases_rejects_a_filename_containing_whitespace() {
+        // Squirrel.Windows' entry parser matches (\S+) and throws on a
+        // non-matching line, taking the whole feed down with it.
+        let mut release = nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 1);
+        release.assets[0].filename = "My App-1.5.0-full.nupkg".to_owned();
+        let index = Index { releases: vec![release] };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::FilenameHasWhitespace {
+                filename: "My App-1.5.0-full.nupkg".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn releases_rejects_a_filename_containing_a_newline() {
+        // A newline would inject a fabricated entry into the feed.
+        let mut release = nupkg_release("1.5.0", "b858cb282617fb0956d960215c8e84d1ccf909c6", 1);
+        release.assets[0].filename = "a.nupkg\nff 1".to_owned();
+        let index = Index { releases: vec![release] };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::FilenameHasWhitespace {
+                filename: "a.nupkg\nff 1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn releases_rejects_a_sha1_that_is_not_40_hex_characters() {
+        let index = Index { releases: vec![nupkg_release("1.5.0", "deadbeef", 1)] };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::MalformedSha1 {
+                filename: "myapp-1.5.0-full.nupkg".to_owned(),
+                sha1: "deadbeef".to_owned(),
+            })
+        );
+
+        // Right length, wrong alphabet.
+        let index = Index {
+            releases: vec![nupkg_release("1.5.0", &"z".repeat(40), 1)],
+        };
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::MalformedSha1 {
+                filename: "myapp-1.5.0-full.nupkg".to_owned(),
+                sha1: "z".repeat(40),
+            })
+        );
     }
 
     #[test]
