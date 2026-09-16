@@ -78,6 +78,19 @@ pub enum AssetKind {
     Exe,
 }
 
+impl fmt::Display for AssetKind {
+    /// Tokens must match the `rename_all = "lowercase"` serde representation
+    /// above: these are the same wire tokens seen from two directions.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            AssetKind::Zip => "zip",
+            AssetKind::Nupkg => "nupkg",
+            AssetKind::Dmg => "dmg",
+            AssetKind::Exe => "exe",
+        })
+    }
+}
+
 /// Percentage of the fleet eligible for a release. Constrained at the type
 /// level so an out-of-range value cannot make every client eligible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

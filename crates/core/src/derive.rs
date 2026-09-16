@@ -7,7 +7,7 @@ use crate::resolve;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DeriveError {
     #[error("release {version} has no {kind} asset")]
-    NoAsset { version: String, kind: &'static str },
+    NoAsset { version: String, kind: AssetKind },
 }
 
 /// The Squirrel.Mac manifest. Field declaration order IS the serialized
@@ -39,7 +39,7 @@ pub fn derive_latest(
     let Some(release) = resolve::resolve_eligible(index, &coord.app, &coord.channel, None) else {
         return Ok(None);
     };
-    let asset = pick(release, AssetKind::Zip, "zip")?;
+    let asset = pick(release, AssetKind::Zip)?;
     let manifest = LatestManifest {
         url: coord.download_url(base_url, &release.version, &asset.filename),
         name: release.version.to_string(),
@@ -54,18 +54,14 @@ pub fn derive_latest(
     )))
 }
 
-fn pick<'a>(
-    release: &'a Release,
-    kind: AssetKind,
-    label: &'static str,
-) -> Result<&'a crate::model::Asset, DeriveError> {
+fn pick(release: &Release, kind: AssetKind) -> Result<&crate::model::Asset, DeriveError> {
     release
         .assets
         .iter()
         .find(|asset| asset.kind == kind)
         .ok_or_else(|| DeriveError::NoAsset {
             version: release.version.to_string(),
-            kind: label,
+            kind,
         })
 }
 
@@ -88,7 +84,7 @@ pub fn derive_releases(index: &Index) -> Result<Vec<u8>, DeriveError> {
 
     let mut out = String::new();
     for release in releases {
-        let asset = pick(release, AssetKind::Nupkg, "nupkg")?;
+        let asset = pick(release, AssetKind::Nupkg)?;
         out.push_str(&format!(
             "{} {} {}\n",
             asset.sha1, asset.filename, asset.size_bytes
@@ -198,7 +194,13 @@ mod tests {
         let mut release = zip_release("1.5.0", 100);
         release.assets[0].kind = AssetKind::Dmg;
         let index = Index { releases: vec![release] };
-        assert!(derive_latest(&index, &coord(), "https://updates.example.com").is_err());
+        assert_eq!(
+            derive_latest(&index, &coord(), "https://updates.example.com"),
+            Err(DeriveError::NoAsset {
+                version: "1.5.0".to_owned(),
+                kind: AssetKind::Zip,
+            })
+        );
     }
 
     fn nupkg_release(version: &str, sha1: &str, size: u64) -> Release {
@@ -266,6 +268,12 @@ mod tests {
     #[test]
     fn releases_errors_when_a_release_has_no_nupkg() {
         let index = Index { releases: vec![zip_release("1.5.0", 100)] };
-        assert!(derive_releases(&index).is_err());
+        assert_eq!(
+            derive_releases(&index),
+            Err(DeriveError::NoAsset {
+                version: "1.5.0".to_owned(),
+                kind: AssetKind::Nupkg,
+            })
+        );
     }
 }
