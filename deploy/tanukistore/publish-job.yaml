@@ -15,12 +15,14 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
       containers:
         - name: publish
-          image: localhost:5000/tanukistore:0.2.0
+          image: ghcr.io/julianshen/tanukistore:0.2.0-rc.1
           command: ["/bin/sh", "-c"]
           args:
             - |

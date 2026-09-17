@@ -1,7 +1,9 @@
 # tanukistore-server on k3s.
 #
-# Image is built on the node and pushed to the node-local registry:
-#   docker build -t localhost:5000/tanukistore:0.2.0 . && docker push localhost:5000/tanukistore:0.2.0
+# Image is published to GHCR by .github/workflows/image.yml. The package is
+# private (it inherits the repo's visibility), so pulls need a read-only token:
+#   kubectl -n tanukistore create secret docker-registry ghcr-pull \
+#     --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT with read:packages>
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -17,13 +19,15 @@ spec:
     metadata:
       labels: { app: tanukistore }
     spec:
+      imagePullSecrets:
+        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
       containers:
         - name: server
-          image: localhost:5000/tanukistore:0.2.0
+          image: ghcr.io/julianshen/tanukistore:0.2.0-rc.1
           env:
             - { name: S3_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
             # Where clients will fetch presigned URLs from. In-cluster for now;
