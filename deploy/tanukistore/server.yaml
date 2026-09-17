@@ -1,9 +1,7 @@
 # tanukistore-server on k3s.
 #
-# Image is published to GHCR by .github/workflows/image.yml. The package is
-# private (it inherits the repo's visibility), so pulls need a read-only token:
-#   kubectl -n tanukistore create secret docker-registry ghcr-pull \
-#     --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT with read:packages>
+# Image is published to GHCR by .github/workflows/image.yml as a public
+# package, so no pull secret is needed.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -19,8 +17,6 @@ spec:
     metadata:
       labels: { app: tanukistore }
     spec:
-      imagePullSecrets:
-        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

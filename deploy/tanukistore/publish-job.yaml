@@ -15,8 +15,6 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      imagePullSecrets:
-        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
