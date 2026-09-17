@@ -1,6 +1,6 @@
 //! Overload protection, added after load testing OOM-killed the server.
 //!
-//! Past its capacity (~13k req/s per core in the mixed feed test) the server
+//! Past its capacity (~12.7k req/s per core in the mixed feed test) the server
 //! used to accept every connection and queue every request. Clients kept
 //! opening connections, each holding ~28KB of buffers, and memory went from
 //! 29MiB to 199MiB in 40s before the pod was OOM-killed. Two bounds fix that:
@@ -11,6 +11,24 @@
 //!   queue past capacity only makes every client slow.
 //! - a cap on OPEN CONNECTIONS, enforced at accept. Beyond it, new clients
 //!   wait in the kernel's accept backlog instead of in this process's memory.
+//!
+//! Sizing, from the sweep in loadtest/RESULTS-tanukistore-2026-09-17.md:
+//!
+//! - The CONNECTION cap is what bounds latency. With HTTP/1.1 each connection
+//!   carries one request at a time, so past capacity the wait is roughly
+//!   (open connections x service time): 2048 gave a 313ms p95, 512 gave
+//!   60-90ms, 256 gave 22ms.
+//! - It must leave room for IDLE keep-alive connections, which hold a permit
+//!   while doing nothing. 256 starved an ordinary 4k req/s load for that
+//!   reason; 512 did not.
+//! - The IN-FLIGHT cap must sit ABOVE the connection cap. Under HTTP/1.1
+//!   in-flight can never exceed open connections, so a lower in-flight cap
+//!   only fires in bursts - and it did, shedding 1% of a 4k req/s load
+//!   against a cold cache. It remains as the bound for HTTP/2, where one
+//!   connection multiplexes many requests.
+//! - Capping costs goodput under overload (~7.4k vs ~12.8k req/s per core,
+//!   same 52% kernel share either way) in exchange for bounded latency and
+//!   memory. Uncapped, the same overload reached a 943ms p95 and 192MiB.
 
 use std::io;
 use std::pin::Pin;

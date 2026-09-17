@@ -42,10 +42,10 @@ async fn main() -> Result<()> {
             .parse()
             .context("TANUKI_PRESIGN_TTL_SECS must be an integer")?,
     );
-    let max_in_flight: usize = env_or("TANUKI_MAX_IN_FLIGHT", "256")
+    let max_in_flight: usize = env_or("TANUKI_MAX_IN_FLIGHT", "1024")
         .parse()
         .context("TANUKI_MAX_IN_FLIGHT must be an integer")?;
-    let max_connections: usize = env_or("TANUKI_MAX_CONNECTIONS", "2048")
+    let max_connections: usize = env_or("TANUKI_MAX_CONNECTIONS", "512")
         .parse()
         .context("TANUKI_MAX_CONNECTIONS must be an integer")?;
     let public_addr: SocketAddr = env_or("TANUKI_PUBLIC_ADDR", "0.0.0.0:8080").parse()?;
