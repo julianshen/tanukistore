@@ -24,12 +24,19 @@ spec:
             - { name: MODE, value: "stepped" }
             - { name: RATE, value: "1000" }
             - { name: DURATION, value: "40s" }
+            # Go sizes its scheduler from the NODE's 16 cores, not from this
+            # container's quota, so without this k6 bursts past its limit and
+            # CFS freezes it for whole 100ms periods - which k6 then reports as
+            # server latency. The first stepped run showed exactly that: a
+            # 0.46ms median beside a 273ms p95 while the server sat at 0.86 of
+            # its 1 core, unthrottled. Keep this equal to limits.cpu.
+            - { name: GOMAXPROCS, value: "12" }
           resources:
-            requests: { cpu: "2", memory: 512Mi }
-            # 8 cores against a server capped at 1. The MinIO runs showed a
-            # 4-core k6 becoming the ceiling; for small requests the generator
+            requests: { cpu: "4", memory: 1Gi }
+            # 12 cores against a server capped at 1. For tiny requests the
+            # generator does more work per request than the server does, so it
             # needs far more headroom than the thing it is measuring.
-            limits: { cpu: "8", memory: 4Gi }
+            limits: { cpu: "12", memory: 6Gi }
           volumeMounts:
             - { name: scripts, mountPath: /scripts }
       volumes:

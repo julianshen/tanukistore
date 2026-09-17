@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{MatchedPath, Path, Query, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -22,6 +23,10 @@ use tanukistore_core::keys::{Coordinate, KeyKind, config_key};
 use tanukistore_core::model::{Arch, AssetKind, Index, Platform, Release};
 use tanukistore_core::resolve::resolve_eligible;
 use tanukistore_core::store::ObjectStore;
+use tower::ServiceBuilder;
+use tower::limit::GlobalConcurrencyLimitLayer;
+
+pub mod overload;
 
 pub type DynStore = Arc<dyn ObjectStore>;
 
@@ -30,9 +35,13 @@ pub struct AppState {
     /// Spec 6.1: presigning happens only when a download starts, so the URL
     /// merely has to outlive connection setup and a client retry.
     pub presign_ttl: Duration,
+    /// Requests allowed in flight across ALL routes before new ones are shed
+    /// with a 503. See `overload`.
+    pub max_in_flight: usize,
 }
 
 pub fn public_router(state: Arc<AppState>) -> Router {
+    let max_in_flight = state.max_in_flight;
     Router::new()
         // axum has no optional path segments, so each `[/:channel]` variant is
         // registered twice (spec 6).
@@ -58,6 +67,16 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         .route("/download/{app}/latest", get(download_latest))
         .route("/download/{app}/{version}", get(download_version))
         .route("/notes/{app}/{version}", get(notes))
+        // GLOBAL, not per-route: `Router::layer` instantiates a layer for each
+        // route, and a plain ConcurrencyLimitLayer would then give every route
+        // its own budget - a cap nine times larger than the number configured.
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(overload::overloaded))
+                .load_shed()
+                .layer(GlobalConcurrencyLimitLayer::new(max_in_flight)),
+        )
+        // Outermost, so shed requests are counted too.
         .layer(middleware::from_fn(record_request))
         .with_state(state)
 }

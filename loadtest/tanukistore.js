@@ -54,7 +54,7 @@ function stepped() {
     startRate: levels[0],
     timeUnit: '1s',
     preAllocatedVUs: 200,
-    maxVUs: 2000,
+    maxVUs: 6000,
     stages,
   };
 }
@@ -66,7 +66,7 @@ function constant() {
     timeUnit: '1s',
     duration: __ENV.DURATION || '40s',
     preAllocatedVUs: 200,
-    maxVUs: 2000,
+    maxVUs: 6000,
   };
 }
 

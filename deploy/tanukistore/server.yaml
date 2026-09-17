@@ -23,7 +23,7 @@ spec:
         runAsGroup: 10001
       containers:
         - name: server
-          image: ghcr.io/julianshen/tanukistore:0.2.0-rc.1
+          image: ghcr.io/julianshen/tanukistore:0.2.0-rc.2
           env:
             - { name: S3_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
             # Where clients will fetch presigned URLs from. In-cluster for now;
@@ -31,6 +31,12 @@ spec:
             # SigV4 signature covers the Host header.
             - { name: S3_PRESIGN_ENDPOINT, value: "http://minio.tanukistore.svc.cluster.local:9000" }
             - { name: S3_BUCKET, value: tanukistore }
+            # Overload bounds (see crates/server/src/overload.rs). One core
+            # serves ~13k req/s of the mixed feed; beyond that, shed fast rather
+            # than queue. 2048 connections at ~28KB each stays well inside the
+            # 256Mi limit that an unbounded server blew through.
+            - { name: TANUKI_MAX_IN_FLIGHT, value: "256" }
+            - { name: TANUKI_MAX_CONNECTIONS, value: "2048" }
             - name: S3_ACCESS_KEY
               valueFrom: { secretKeyRef: { name: tanukistore-server-s3, key: access-key } }
             - name: S3_SECRET_KEY

@@ -98,6 +98,7 @@ fn app(store: Arc<InMemoryStore>) -> axum::Router {
     public_router(Arc::new(AppState {
         cache: ManifestCache::new(store, CacheConfig::default()),
         presign_ttl: Duration::from_secs(900),
+        max_in_flight: 256,
     }))
 }
 
@@ -335,6 +336,42 @@ async fn a_warm_cache_keeps_serving_through_an_origin_outage() {
     store.set_failing(true);
     assert_eq!(
         get(&router, "/update/myapp/darwin/arm64/1.0.0").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn requests_beyond_the_in_flight_cap_are_shed_immediately() {
+    let store = seeded();
+    // Cold cache plus a slow origin keeps the first request in flight.
+    store.set_delay(Duration::from_millis(300));
+    let dyn_store: DynStore = store;
+    let router = public_router(Arc::new(AppState {
+        cache: ManifestCache::new(dyn_store, CacheConfig::default()),
+        presign_ttl: Duration::from_secs(900),
+        max_in_flight: 1,
+    }));
+
+    let slow = {
+        let router = router.clone();
+        tokio::spawn(async move { get(&router, "/update/myapp/darwin/arm64/1.0.0").await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A DIFFERENT route: the cap must be process-wide, not per route.
+    let started = std::time::Instant::now();
+    let (status, headers, _) = get(&router, "/update/myapp/win32/x64/RELEASES").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers[header::RETRY_AFTER], "1");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "shedding must answer at once, not wait for a slot"
+    );
+
+    assert_eq!(slow.await.unwrap().0, StatusCode::OK);
+    // With the slot free again, requests are served.
+    assert_eq!(
+        get(&router, "/update/myapp/win32/x64/RELEASES").await.0,
         StatusCode::OK
     );
 }

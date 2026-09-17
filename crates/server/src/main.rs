@@ -7,6 +7,7 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tanukistore_core::breaker::{BreakerConfig, CircuitBreakerStore};
 use tanukistore_core::cache::{CacheConfig, ManifestCache};
 use tanukistore_core::store::{S3Config, S3Store};
+use tanukistore_server::overload::BoundedListener;
 use tanukistore_server::{AppState, DynStore, admin_router, public_router};
 use tokio::net::TcpListener;
 
@@ -41,6 +42,12 @@ async fn main() -> Result<()> {
             .parse()
             .context("TANUKI_PRESIGN_TTL_SECS must be an integer")?,
     );
+    let max_in_flight: usize = env_or("TANUKI_MAX_IN_FLIGHT", "256")
+        .parse()
+        .context("TANUKI_MAX_IN_FLIGHT must be an integer")?;
+    let max_connections: usize = env_or("TANUKI_MAX_CONNECTIONS", "2048")
+        .parse()
+        .context("TANUKI_MAX_CONNECTIONS must be an integer")?;
     let public_addr: SocketAddr = env_or("TANUKI_PUBLIC_ADDR", "0.0.0.0:8080").parse()?;
     let admin_addr: SocketAddr = env_or("TANUKI_ADMIN_ADDR", "0.0.0.0:9090").parse()?;
 
@@ -53,6 +60,17 @@ async fn main() -> Result<()> {
         )?
         .install_recorder()
         .context("installing the metrics recorder")?;
+    // `install_recorder` does not start the exporter's upkeep task, and without
+    // it every histogram sample is retained until the next /metrics scrape - an
+    // unbounded buffer on any pod nobody scrapes.
+    let upkeep = metrics.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            upkeep.run_upkeep();
+        }
+    });
 
     tracing::info!(bucket = %s3.bucket, endpoint = %s3.endpoint, "starting tanukistore-server");
     let store: DynStore = Arc::new(CircuitBreakerStore::new(
@@ -62,16 +80,20 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         cache: ManifestCache::new(store, CacheConfig::default()),
         presign_ttl,
+        max_in_flight,
     });
 
     // Two listeners (spec 6.1), so /metrics is never reachable from the feed.
-    let public = TcpListener::bind(public_addr)
-        .await
-        .with_context(|| format!("binding {public_addr}"))?;
+    let public = BoundedListener::new(
+        TcpListener::bind(public_addr)
+            .await
+            .with_context(|| format!("binding {public_addr}"))?,
+        max_connections,
+    );
     let admin = TcpListener::bind(admin_addr)
         .await
         .with_context(|| format!("binding {admin_addr}"))?;
-    tracing::info!(%public_addr, %admin_addr, "listening");
+    tracing::info!(%public_addr, %admin_addr, max_in_flight, max_connections, "listening");
 
     let render = move || metrics.render();
     let public_server =
